@@ -137,6 +137,8 @@ if drm_dep.found()
     default_options: ['default_library=static'],
   )
 else
+  # Stub implementations for DRM symbols when DRM backend is disabled
+  src += 'drm_stubs.cpp'
   liftoff_dep = dependency('', required: false)
 endif
 

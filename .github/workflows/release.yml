@@ -1,0 +1,80 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+      - 'splitux-*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build release for'
+        required: true
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - name: Prepare
+        run: |
+          pacman-key --init
+          pacman -Syu --noconfirm
+          pacman -S --noconfirm git meson clang glslang libcap wlroots0.18 \
+            sdl2 vulkan-headers libx11 libxmu libxcomposite libxrender libxres \
+            libxtst libxkbcommon libdrm libinput wayland-protocols benchmark \
+            xorg-xwayland pipewire cmake \
+            libavif libheif aom rav1e libdecor libxdamage \
+            luajit zip
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+          submodules: recursive
+
+      - name: Get version
+        id: version
+        run: |
+          if [ -n "${{ github.event.inputs.tag }}" ]; then
+            echo "version=${{ github.event.inputs.tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build
+        run: |
+          export CC=gcc CXX=g++
+          meson build/ -Dinput_emulation=disabled --auto-features=enabled -Dbuildtype=release
+          ninja -C build/
+
+      - name: Package
+        run: |
+          mkdir -p package/bin
+          cp build/src/gamescope package/bin/
+          cp build/src/gamescopereaper package/bin/
+          cp build/src/gamescopectl package/bin/
+          strip package/bin/*
+          cd package && zip -r ../gamescope-splitux-${{ steps.version.outputs.version }}.zip .
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          name: gamescope-splitux ${{ steps.version.outputs.version }}
+          body: |
+            ## gamescope-splitux ${{ steps.version.outputs.version }}
+
+            Gamescope fork with input device holding support for splitux split-screen gaming.
+
+            ### Features
+            - `--input-hold-keyboards` - Hold keyboard devices
+            - `--input-hold-mice` - Hold mouse devices
+            - `--input-hold-gamepads` - Hold gamepad devices
+            - `--input-hold-touchscreens` - Hold touchscreen devices
+            - `--input-hold-all` - Hold all input device types
+
+            ### Installation
+            Extract and copy binaries to your PATH, or use with splitux.
+          draft: false
+          prerelease: false
+          files: gamescope-splitux-${{ steps.version.outputs.version }}.zip

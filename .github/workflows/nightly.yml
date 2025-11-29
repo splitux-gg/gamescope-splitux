@@ -1,0 +1,66 @@
+name: Nightly Build
+
+on:
+  schedule:
+    - cron: '0 4 * * *'  # Run at 4 AM UTC daily
+  workflow_dispatch:
+
+jobs:
+  nightly:
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - name: Prepare
+        run: |
+          pacman-key --init
+          pacman -Syu --noconfirm
+          pacman -S --noconfirm git meson clang glslang libcap wlroots0.18 \
+            sdl2 vulkan-headers libx11 libxmu libxcomposite libxrender libxres \
+            libxtst libxkbcommon libdrm libinput wayland-protocols benchmark \
+            xorg-xwayland pipewire cmake \
+            libavif libheif aom rav1e libdecor libxdamage \
+            luajit zip
+
+      - uses: actions/checkout@v4
+        with:
+          ref: splitux-input-holding
+          submodules: recursive
+
+      - name: Build
+        run: |
+          export CC=gcc CXX=g++
+          meson build/ -Dinput_emulation=disabled --auto-features=enabled -Dbuildtype=release
+          ninja -C build/
+
+      - name: Package
+        run: |
+          mkdir -p package/bin
+          cp build/src/gamescope package/bin/
+          cp build/src/gamescopereaper package/bin/
+          cp build/src/gamescopectl package/bin/
+          strip package/bin/*
+          cd package && zip -r ../gamescope-splitux-nightly.zip .
+
+      - name: Delete old nightly release
+        uses: dev-drprasad/delete-tag-and-release@v1.1
+        with:
+          tag_name: nightly
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          delete_release: true
+        continue-on-error: true
+
+      - name: Create nightly release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: nightly
+          name: Nightly Build
+          body: |
+            Automated nightly build from splitux-input-holding branch.
+
+            **Features:**
+            - Input device holding for split-screen gaming
+            - CLI options: --input-hold-keyboards, --input-hold-mice, --input-hold-gamepads, --input-hold-touchscreens, --input-hold-all
+
+            Built on: ${{ github.event.repository.updated_at }}
+          prerelease: true
+          files: gamescope-splitux-nightly.zip

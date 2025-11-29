@@ -8,8 +8,10 @@
 #define HDMI_EOTF_ST2084 2
 #define HDMI_EOTF_HLG 3
 
-#if HAVE_DRM
-#include <drm_mode.h>
+// Check if drm_mode.h already defined these structs (newer libdrm versions do)
+// We detect this by checking for a define that's always present in drm_mode.h
+#if defined(DRM_MODE_OBJECT_CRTC) || HAVE_DRM
+// Structs already defined by drm_mode.h, nothing to do
 #else
 /**
  * struct hdr_metadata_infoframe - HDR Metadata Infoframe Data.

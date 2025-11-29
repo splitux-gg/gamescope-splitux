@@ -1,10 +1,12 @@
 // For the nested case, reads input from the SDL window and send to wayland
 
 #include <X11/Xlib.h>
+#include <linux/input.h>
 #include <thread>
 #include <mutex>
 #include <string>
 #include <optional>
+#include <bitset>
 
 #include <linux/input-event-codes.h>
 #include <signal.h>
@@ -20,6 +22,8 @@
 #include "steamcompmgr.hpp"
 #include "Utils/Defer.h"
 #include "refresh_rate.h"
+
+#include "LibInputHandler.h"
 
 #include "sdlscancodetable.hpp"
 
@@ -190,6 +194,9 @@ namespace gamescope
 		CSDLConnector m_Connector; // Window.
 		uint32_t m_uUserEventIdBase = 0u;
 		std::vector<const char *> m_pszInstanceExtensions;
+
+		// Splitux input holding
+		std::shared_ptr<CLibInputHandler> m_pLibInput;
 
 		std::thread m_SDLThread;
 		std::atomic<SDLInitState> m_eSDLInit = { SDLInitState::SDLInit_Waiting };
@@ -400,6 +407,17 @@ namespace gamescope
 
 	bool CSDLBackend::Init()
 	{
+		// Splitux: Initialize libinput if devices are specified
+		if (g_libinputSelectedDevices.size() > 0) {
+			std::unique_ptr<CLibInputHandler> pLibInput = std::make_unique<CLibInputHandler>();
+			if ( pLibInput->Init() ) {
+				m_pLibInput = std::move( pLibInput );
+			} else {
+				fprintf(stderr, "CSDLBackend::Init failed: Unable to register LIBINPUT devices\n");
+				return false;
+			}
+		}
+
 		m_eSDLInit.wait( SDLInitState::SDLInit_Waiting );
 
 		return m_eSDLInit == SDLInitState::SDLInit_Success;
@@ -664,6 +682,7 @@ namespace gamescope
 
 				case SDL_MOUSEMOTION:
 				{
+					if (g_bMouseDisabled) break;
 					if ( m_bApplicationGrabbed )
 					{
 						if ( g_bWindowFocused )
@@ -689,6 +708,7 @@ namespace gamescope
 				case SDL_MOUSEBUTTONDOWN:
 				case SDL_MOUSEBUTTONUP:
 				{
+					if (g_bMouseDisabled) break;
 					wlserver_lock();
 					wlserver_mousebutton( SDLButtonToLinuxButton( event.button.button ),
 										event.button.state == SDL_PRESSED,
@@ -699,6 +719,7 @@ namespace gamescope
 
 				case SDL_MOUSEWHEEL:
 				{
+					if (g_bMouseDisabled) break;
 					wlserver_lock();
 					wlserver_mousewheel( -event.wheel.x, -event.wheel.y, fake_timestamp );
 					wlserver_unlock();
@@ -731,6 +752,7 @@ namespace gamescope
 
 				case SDL_KEYDOWN:
 				{
+					if (g_bKeyboardDisabled) break;
 					// If this keydown event is super + one of the shortcut keys, consume the keydown event, since the corresponding keyup
 					// event will be consumed by the next case statement when the user releases the key
 					if ( event.key.keysym.mod & KMOD_LGUI )
@@ -747,6 +769,7 @@ namespace gamescope
 				[[fallthrough]];
 				case SDL_KEYUP:
 				{
+					if (g_bKeyboardDisabled) break;
 					uint32_t key = SDLScancodeToLinuxKey( event.key.keysym.scancode );
 
 					if ( event.type == SDL_KEYUP && ( event.key.keysym.mod & KMOD_LGUI ) )
@@ -783,6 +806,20 @@ namespace gamescope
 								break;
 							case KEY_G:
 								g_bGrabbed = !g_bGrabbed;
+
+								// Splitux: Grab/ungrab libinput devices
+								for (int dev_fd : g_libinputSelectedDevices_grabbed_fds) {
+									if (g_bGrabbed) {
+										if (ioctl(dev_fd, EVIOCGRAB, 1) < 0) {
+											fprintf(stderr, "SDL: Failed to grab exclusive lock on device: %d\n", dev_fd);
+										}
+									} else {
+										if (ioctl(dev_fd, EVIOCGRAB, 0) < 0) {
+											fprintf(stderr, "SDL: Failed to release exclusive grab on device: %d\n", dev_fd);
+										}
+									}
+								}
+
 								SDL_SetWindowKeyboardGrab( m_Connector.GetSDLWindow(), g_bGrabbed ? SDL_TRUE : SDL_FALSE );
 
 								SDL_Event event;

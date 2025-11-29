@@ -12,11 +12,13 @@
 #include "Utils/TempFiles.h"
 
 #include <cstring>
+#include <linux/input.h>
 #include <unordered_map>
 #include <unordered_set>
 #include <csignal>
 #include <sys/mman.h>
 #include <poll.h>
+#include <bitset>
 #include <linux/input-event-codes.h>
 #include <xkbcommon/xkbcommon.h>
 #include <libdecor.h>
@@ -36,6 +38,8 @@
 #include <fractional-scale-v1-client-protocol.h>
 #include <xdg-toplevel-icon-v1-client-protocol.h>
 #include "wlr_end.hpp"
+
+#include "LibInputHandler.h"
 
 #include "drm_include.h"
 
@@ -808,6 +812,9 @@ namespace gamescope
         wl_surface *m_pCursorSurface = nullptr;
         std::shared_ptr<INestedHints::CursorInfo> m_pDefaultCursorInfo;
         wl_surface *m_pDefaultCursorSurface = nullptr;
+
+        // Splitux input holding
+        std::shared_ptr<CLibInputHandler> m_pLibInput;
     };
     const wl_registry_listener CWaylandBackend::s_RegistryListener =
     {
@@ -1927,6 +1934,17 @@ namespace gamescope
 
     bool CWaylandBackend::Init()
     {
+        // Splitux: Initialize libinput if devices are specified
+        if (g_libinputSelectedDevices.size() > 0) {
+            std::unique_ptr<CLibInputHandler> pLibInput = std::make_unique<CLibInputHandler>();
+            if ( pLibInput->Init() ) {
+                m_pLibInput = std::move( pLibInput );
+            } else {
+                xdg_log.errorf( "CWaylandBackend::Init failed: Unable to register LIBINPUT devices" );
+                return false;
+            }
+        }
+
         g_nOutputWidth = g_nPreferredOutputWidth;
         g_nOutputHeight = g_nPreferredOutputHeight;
         g_nOutputRefresh = g_nNestedRefresh;
@@ -2836,8 +2854,36 @@ namespace gamescope
 
     void CWaylandInputThread::HandleKey( uint32_t uKey, bool bPressed )
     {
+        if (g_bKeyboardDisabled) return;
+
         if ( m_uKeyModifiers & m_uModMask[ GAMESCOPE_WAYLAND_MOD_META ] )
         {
+            // Splitux: Track held keys for grab toggle on all keys up
+            static std::bitset<KEY_MAX+1> held_keys;
+            static bool toggle_grab_on_all_keys_up = false;
+
+            if (uKey <= KEY_MAX) {
+                held_keys[uKey] = bPressed;
+            }
+            if (held_keys[KEY_G] && held_keys[KEY_LEFTMETA]) toggle_grab_on_all_keys_up = true;
+
+            if (toggle_grab_on_all_keys_up && held_keys.none()) {
+                toggle_grab_on_all_keys_up = false;
+                g_bGrabbed = !g_bGrabbed;
+
+                for (int dev_fd : g_libinputSelectedDevices_grabbed_fds) {
+                    if (g_bGrabbed) {
+                        if (ioctl(dev_fd, EVIOCGRAB, 1) < 0) {
+                            fprintf(stderr, "Wayland: Failed to grab exclusive lock on device: %d\n", dev_fd);
+                        }
+                    } else {
+                        if (ioctl(dev_fd, EVIOCGRAB, 0) < 0) {
+                            fprintf(stderr, "Wayland: Failed to release exclusive grab on device: %d\n", dev_fd);
+                        }
+                    }
+                }
+            }
+
             switch ( uKey )
             {
                 case KEY_F:
@@ -2981,6 +3027,7 @@ namespace gamescope
 
     void CWaylandInputThread::Wayland_Pointer_Enter( wl_pointer *pPointer, uint32_t uSerial, wl_surface *pSurface, wl_fixed_t fSurfaceX, wl_fixed_t fSurfaceY )
     {
+        if (g_bMouseDisabled) return;
         if ( !IsSurfacePlane( pSurface ) )
             return;
 
@@ -2995,6 +3042,7 @@ namespace gamescope
     }
     void CWaylandInputThread::Wayland_Pointer_Leave( wl_pointer *pPointer, uint32_t uSerial, wl_surface *pSurface )
     {
+        if (g_bMouseDisabled) return;
         if ( !IsSurfacePlane( pSurface ) )
             return;
 
@@ -3008,6 +3056,7 @@ namespace gamescope
     }
     void CWaylandInputThread::Wayland_Pointer_Motion( wl_pointer *pPointer, uint32_t uTime, wl_fixed_t fSurfaceX, wl_fixed_t fSurfaceY )
     {
+        if (g_bMouseDisabled) return;
         if ( m_pRelativePointer.load() != nullptr )
             return;
 
@@ -3037,6 +3086,7 @@ namespace gamescope
     }
     void CWaylandInputThread::Wayland_Pointer_Button( wl_pointer *pPointer, uint32_t uSerial, uint32_t uTime, uint32_t uButton, uint32_t uState )
     {
+        if (g_bMouseDisabled) return;
         // Don't do any motion/movement stuff if we don't have kb focus
         if ( !cv_wayland_mouse_warp_without_keyboard_focus && !m_bKeyboardEntered )
             return;

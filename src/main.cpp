@@ -8,6 +8,7 @@
 #include <vector>
 #include <cstring>
 #include <string>
+#include <sstream>
 #if defined(__linux__)
 #include <sys/capability.h>
 #endif
@@ -151,6 +152,11 @@ const struct option *gamescope_options = (struct option[]){
 	// Steam Deck options
 	{ "mura-map", required_argument, nullptr, 0 },
 
+	// Splitux input holding options
+	{ "libinput-hold-dev", required_argument, nullptr, 0 },
+	{ "backend-disable-keyboard", no_argument, nullptr, 0 },
+	{ "backend-disable-mouse", no_argument, nullptr, 0 },
+
 	{} // keep last
 };
 
@@ -265,6 +271,11 @@ const char usage[] =
 	"Steam Deck options:\n"
 	"  --mura-map                     Set the mura compensation map to use for the display. Takes in a path to the mura map.\n"
 	"\n"
+	"Splitux input holding options:\n"
+	"  --libinput-hold-dev            Comma separated list of evdev device paths to hold (WAYLAND & SDL ONLY)\n"
+	"  --backend-disable-keyboard     Disable normal backend keyboard input (WAYLAND & SDL ONLY)\n"
+	"  --backend-disable-mouse        Disable normal backend mouse input (WAYLAND & SDL ONLY)\n"
+	"\n"
 	"Keyboard shortcuts:\n"
 	"  Super + F                      toggle fullscreen\n"
 	"  Super + N                      toggle nearest neighbour filtering\n"
@@ -293,6 +304,12 @@ bool g_bFullscreen = false;
 bool g_bForceRelativeMouse = false;
 
 bool g_bGrabbed = false;
+
+// Splitux input holding
+bool g_bKeyboardDisabled = false;
+bool g_bMouseDisabled = false;
+std::vector<std::string> g_libinputSelectedDevices;
+std::vector<int> g_libinputSelectedDevices_grabbed_fds;
 
 float g_mouseSensitivity = 1.0;
 
@@ -818,9 +835,19 @@ int main(int argc, char **argv)
 						if ( optarg == gamescope::VirtualConnectorStrategyToString( eStrategy ) )
 						{
 							gamescope::cv_backend_virtual_connector_strategy = eStrategy;
-								
+
 						}
 					}
+				} else if (strcmp(opt_name, "libinput-hold-dev") == 0) {
+					std::string item;
+					std::istringstream ss(optarg);
+					while (std::getline(ss, item, ',')) {
+						g_libinputSelectedDevices.push_back(item);
+					}
+				} else if (strcmp(opt_name, "backend-disable-keyboard") == 0) {
+					g_bKeyboardDisabled = true;
+				} else if (strcmp(opt_name, "backend-disable-mouse") == 0) {
+					g_bMouseDisabled = true;
 				}
 				break;
 			case '?':

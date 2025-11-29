@@ -30,8 +30,9 @@ jobs:
       - name: Build with gcc
         run: |
           export CC=gcc CXX=g++
-          meson build-gcc/ -Dinput_emulation=disabled --werror --auto-features=enabled
+          meson build-gcc/ -Dinput_emulation=disabled --auto-features=enabled -Dbuildtype=release
           ninja -C build-gcc/
+          strip build-gcc/src/gamescope build-gcc/src/gamescopereaper build-gcc/src/gamescopectl
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4

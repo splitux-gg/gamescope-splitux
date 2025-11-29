@@ -6,11 +6,8 @@
 
 #if !HAVE_DRM
 
-// Stub for cv_drm_debug_disable_explicit_sync
-namespace gamescope {
-    ConVar<bool> cv_drm_debug_disable_explicit_sync( "drm_debug_disable_explicit_sync", false, "Force disable explicit sync on the DRM backend." );
-}
-using gamescope::cv_drm_debug_disable_explicit_sync;
+// Stub for cv_drm_debug_disable_explicit_sync - must be in global namespace
+gamescope::ConVar<bool> cv_drm_debug_disable_explicit_sync( "drm_debug_disable_explicit_sync", false, "Force disable explicit sync on the DRM backend." );
 
 // Stub for g_nDynamicRefreshHz
 int g_nDynamicRefreshHz = 0;

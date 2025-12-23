@@ -194,8 +194,12 @@ struct wsi_memory_allocate_info {
 // DRM doesn't have 32bit floating point formats, so add our own
 #define DRM_FORMAT_ABGR32323232F fourcc_code('A', 'B', '8', 'F')
 
+#ifndef DRM_FORMAT_R16F
 #define DRM_FORMAT_R16F fourcc_code('R', '1', '6', 'F')
+#endif
+#ifndef DRM_FORMAT_R32F
 #define DRM_FORMAT_R32F fourcc_code('R', '3', '2', 'F')
+#endif
 
 struct {
 	uint32_t DRMFormat;
@@ -887,6 +891,8 @@ bool CVulkanDevice::createPools()
 	};
 
 	res = vk.GetPhysicalDeviceImageFormatProperties2( physDev(), &imageFormatInfo, &imageFormatProps );
+	vk_log.infof( "YCbCr query: res=%d, combinedImageSamplerDescriptorCount=%u",
+		res, ycbcrProps.combinedImageSamplerDescriptorCount );
 	// Ensure descriptor count is at least 1 - handles both query failure and
 	// edge cases where driver returns 0. The pool sizing formula requires >= 1.
 	if ( res != VK_SUCCESS || ycbcrProps.combinedImageSamplerDescriptorCount == 0 )
@@ -987,7 +993,7 @@ bool CVulkanDevice::createScratchResources()
 	VkResult res = vk.AllocateDescriptorSets(device(), &descriptorSetAllocateInfo, m_descriptorSets.data());
 	if ( res != VK_SUCCESS )
 	{
-		vk_log.errorf( "vkAllocateDescriptorSets failed" );
+		vk_errorf( res, "vkAllocateDescriptorSets failed (sets=%u)", (uint32_t)descriptorSetLayouts.size() );
 		return false;
 	}
 

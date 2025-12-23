@@ -887,6 +887,12 @@ bool CVulkanDevice::createPools()
 	};
 
 	res = vk.GetPhysicalDeviceImageFormatProperties2( physDev(), &imageFormatInfo, &imageFormatProps );
+	// Ensure descriptor count is at least 1 - handles both query failure and
+	// edge cases where driver returns 0. The pool sizing formula requires >= 1.
+	if ( res != VK_SUCCESS || ycbcrProps.combinedImageSamplerDescriptorCount == 0 )
+	{
+		ycbcrProps.combinedImageSamplerDescriptorCount = 1;
+	}
 
 	VkDescriptorPoolSize poolSizes[3] {
 		{

@@ -4,11 +4,18 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <poll.h>
+#include <vector>
+#include <string>
 
 #include "log.hpp"
 #include "backend.h"
 #include "wlserver.hpp"
 #include "Utils/Defer.h"
+
+// Splitux input device filtering (defined in main.cpp)
+extern std::vector<std::string> g_vecLibInputHoldDevices;
+extern bool g_bBackendDisableKeyboard;
+extern bool g_bBackendDisableMouse;
 
 // Handles libinput in contexts where we don't have a session
 // and can't use the wlroots libinput stuff.
@@ -64,18 +71,48 @@ namespace gamescope
             return false;
         }
 
-        m_pLibInput = libinput_udev_create_context( &s_LibInputInterface, nullptr, m_pUdev );
-        if ( !m_pLibInput )
+        // Splitux: If specific devices are requested, use path-based context
+        // instead of grabbing all devices on the seat
+        if ( !g_vecLibInputHoldDevices.empty() )
         {
-            log_input_stealer.errorf( "Failed to create libinput context" );
-            return false;
-        }
+            log_input_stealer.infof( "Using path-based libinput with %zu device(s)", g_vecLibInputHoldDevices.size() );
 
-        const char *pszSeatName = "seat0";
-        if ( libinput_udev_assign_seat( m_pLibInput, pszSeatName ) == -1 )
+            m_pLibInput = libinput_path_create_context( &s_LibInputInterface, nullptr );
+            if ( !m_pLibInput )
+            {
+                log_input_stealer.errorf( "Failed to create path-based libinput context" );
+                return false;
+            }
+
+            for ( const auto& path : g_vecLibInputHoldDevices )
+            {
+                libinput_device *pDevice = libinput_path_add_device( m_pLibInput, path.c_str() );
+                if ( pDevice )
+                {
+                    log_input_stealer.infof( "Added input device: %s", path.c_str() );
+                }
+                else
+                {
+                    log_input_stealer.errorf( "Failed to add input device: %s", path.c_str() );
+                }
+            }
+        }
+        else
         {
-            log_input_stealer.errorf( "Could not assign seat \"%s\"", pszSeatName );
-            return false;
+            // Default behavior: use udev to grab all devices on seat0
+            m_pLibInput = libinput_udev_create_context( &s_LibInputInterface, nullptr, m_pUdev );
+            if ( !m_pLibInput )
+            {
+                log_input_stealer.errorf( "Failed to create libinput context" );
+                return false;
+            }
+
+            const char *pszSeatName = "seat0";
+            if ( libinput_udev_assign_seat( m_pLibInput, pszSeatName ) == -1 )
+            {
+                log_input_stealer.errorf( "Could not assign seat \"%s\"", pszSeatName );
+                return false;
+            }
         }
 
         return true;
@@ -105,6 +142,9 @@ namespace gamescope
             {
                 case LIBINPUT_EVENT_POINTER_MOTION:
                 {
+                    if ( g_bBackendDisableMouse )
+                        break;
+
                     libinput_event_pointer *pPointerEvent = libinput_event_get_pointer_event( pEvent );
 
                     double flDx = libinput_event_pointer_get_dx( pPointerEvent );
@@ -120,6 +160,9 @@ namespace gamescope
 
                 case LIBINPUT_EVENT_POINTER_MOTION_ABSOLUTE:
                 {
+                    if ( g_bBackendDisableMouse )
+                        break;
+
                     libinput_event_pointer *pPointerEvent = libinput_event_get_pointer_event( pEvent );
 
                     double flX = libinput_event_pointer_get_absolute_x( pPointerEvent );
@@ -135,6 +178,9 @@ namespace gamescope
 
                 case LIBINPUT_EVENT_POINTER_BUTTON:
                 {
+                    if ( g_bBackendDisableMouse )
+                        break;
+
                     libinput_event_pointer *pPointerEvent = libinput_event_get_pointer_event( pEvent );
 
                     uint32_t uButton = libinput_event_pointer_get_button( pPointerEvent );
@@ -148,6 +194,9 @@ namespace gamescope
 
                 case LIBINPUT_EVENT_POINTER_SCROLL_WHEEL:
                 {
+                    if ( g_bBackendDisableMouse )
+                        break;
+
                     libinput_event_pointer *pPointerEvent = libinput_event_get_pointer_event( pEvent );
 
                     static constexpr libinput_pointer_axis eAxes[] =
@@ -171,12 +220,15 @@ namespace gamescope
 
                 case LIBINPUT_EVENT_KEYBOARD_KEY:
                 {
+                    if ( g_bBackendDisableKeyboard )
+                        break;
+
                     libinput_event_keyboard *pKeyboardEvent = libinput_event_get_keyboard_event( pEvent );
                     uint32_t uKey = libinput_event_keyboard_get_key( pKeyboardEvent );
                     libinput_key_state eState = libinput_event_keyboard_get_key_state( pKeyboardEvent );
 
                     wlserver_lock();
-                wlserver_key( uKey, eState == LIBINPUT_KEY_STATE_PRESSED, ++    s_uSequence );
+                    wlserver_key( uKey, eState == LIBINPUT_KEY_STATE_PRESSED, ++s_uSequence );
                     wlserver_unlock();
                 }
                 break;

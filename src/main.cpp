@@ -53,6 +53,11 @@ const char *g_pOriginalWaylandDisplay = nullptr;
 
 bool g_bAllowDeferredBackend = false;
 
+// Splitux input device filtering
+std::vector<std::string> g_vecLibInputHoldDevices;
+bool g_bBackendDisableKeyboard = false;
+bool g_bBackendDisableMouse = false;
+
 int g_nCursorScaleHeight = -1;
 
 const struct option *gamescope_options = (struct option[]){
@@ -156,6 +161,11 @@ const struct option *gamescope_options = (struct option[]){
 
 	{ "allow-deferred-backend", no_argument, nullptr, 0 },
 	{ "keep-alive", no_argument, nullptr, 0 },
+
+	// Splitux input device filtering options
+	{ "libinput-hold-dev", required_argument, nullptr, 0 },
+	{ "backend-disable-keyboard", no_argument, nullptr, 0 },
+	{ "backend-disable-mouse", no_argument, nullptr, 0 },
 
 	{} // keep last
 };
@@ -824,6 +834,24 @@ int main(int argc, char **argv)
 					g_bAllowDeferredBackend = true;
 				} else if (strcmp(opt_name, "keep-alive") == 0) {
 					cv_shutdown_on_primary_child_death = false;
+				} else if (strcmp(opt_name, "libinput-hold-dev") == 0) {
+					// Parse comma-separated device paths
+					std::string paths(optarg);
+					size_t pos = 0;
+					while ((pos = paths.find(',')) != std::string::npos) {
+						std::string path = paths.substr(0, pos);
+						if (!path.empty()) {
+							g_vecLibInputHoldDevices.push_back(path);
+						}
+						paths.erase(0, pos + 1);
+					}
+					if (!paths.empty()) {
+						g_vecLibInputHoldDevices.push_back(paths);
+					}
+				} else if (strcmp(opt_name, "backend-disable-keyboard") == 0) {
+					g_bBackendDisableKeyboard = true;
+				} else if (strcmp(opt_name, "backend-disable-mouse") == 0) {
+					g_bBackendDisableMouse = true;
 				} else if (strcmp(opt_name, "virtual-connector-strategy") == 0) {
 					for ( uint32_t i = 0; i < gamescope::VirtualConnectorStrategies::Count; i++ )
 					{

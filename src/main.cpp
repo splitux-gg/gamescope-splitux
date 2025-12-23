@@ -55,6 +55,7 @@ bool g_bAllowDeferredBackend = false;
 
 // Splitux input device filtering
 std::vector<std::string> g_vecLibInputHoldDevices;
+bool g_bUseLibInputDevices = false;
 bool g_bBackendDisableKeyboard = false;
 bool g_bBackendDisableMouse = false;
 
@@ -870,6 +871,9 @@ int main(int argc, char **argv)
 				return 1;
 		}
 	}
+
+	// When libinput device filtering is enabled, use libinput for input instead of parent compositor
+	g_bUseLibInputDevices = !g_vecLibInputHoldDevices.empty();
 
 	if ( gamescope::Process::HasCapSysNice() )
 	{

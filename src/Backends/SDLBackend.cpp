@@ -5,6 +5,7 @@
 #include <mutex>
 #include <string>
 #include <optional>
+#include <poll.h>
 
 #include <linux/input-event-codes.h>
 #include <signal.h>
@@ -20,8 +21,11 @@
 #include "steamcompmgr.hpp"
 #include "Utils/Defer.h"
 #include "refresh_rate.h"
+#include "LibInputHandler.h"
 
 #include "sdlscancodetable.hpp"
+
+extern bool g_bUseLibInputDevices;
 
 static int g_nOldNestedRefresh = 0;
 static bool g_bWindowFocused = true;
@@ -196,6 +200,9 @@ namespace gamescope
 
 		std::thread m_SDLThread;
 		std::atomic<SDLInitState> m_eSDLInit = { SDLInitState::SDLInit_Waiting };
+
+		// Splitux: LibInput handler for input device filtering
+		std::shared_ptr<gamescope::CLibInputHandler> m_pLibInput;
 
 		std::atomic<bool> m_bApplicationGrabbed = { false };
 		std::atomic<bool> m_bApplicationVisible = { false };
@@ -611,6 +618,21 @@ namespace gamescope
 			return;
 		}
 
+		// Splitux: Initialize LibInput handler for input device filtering
+		if ( g_bUseLibInputDevices )
+		{
+			m_pLibInput = std::make_shared<gamescope::CLibInputHandler>();
+			if ( m_pLibInput->Init() )
+			{
+				fprintf( stderr, "[gamescope-splitux] LibInput handler initialized for SDL backend\n" );
+			}
+			else
+			{
+				fprintf( stderr, "[gamescope-splitux] Failed to initialize LibInput handler\n" );
+				m_pLibInput.reset();
+			}
+		}
+
 		// Update g_nOutputWidthPts.
 		{
 			int width, height;
@@ -643,8 +665,27 @@ namespace gamescope
 		wlserver.bWaylandServerRunning.wait( false );
 
 		SDL_Event event;
-		while( SDL_WaitEvent( &event ) )
+		for (;;)
 		{
+			// Splitux: Poll libinput for input from held devices
+			if ( m_pLibInput )
+			{
+				int libinput_fd = m_pLibInput->GetFD();
+				if ( libinput_fd >= 0 )
+				{
+					struct pollfd pfd = { .fd = libinput_fd, .events = POLLIN };
+					if ( poll( &pfd, 1, 0 ) > 0 && ( pfd.revents & POLLIN ) )
+					{
+						m_pLibInput->OnPollIn();
+					}
+				}
+			}
+
+			// Use timeout so we can poll libinput regularly
+			int timeout_ms = m_pLibInput ? 16 : -1; // 60fps polling when libinput active
+			if ( !SDL_WaitEventTimeout( &event, timeout_ms ) )
+				continue; // timeout, loop back to poll libinput
+
 			fake_timestamp++;
 
 			switch( event.type )

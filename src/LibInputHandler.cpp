@@ -6,6 +6,10 @@
 #include <poll.h>
 #include <vector>
 #include <string>
+#include <errno.h>
+#include <stdio.h>
+#include <linux/input.h>
+#include <sys/ioctl.h>
 
 #include "log.hpp"
 #include "backend.h"
@@ -34,11 +38,28 @@ namespace gamescope
     {
         .open_restricted = []( const char *pszPath, int nFlags, void *pUserData ) -> int
         {
-            return open( pszPath, nFlags );
+            int fd = open( pszPath, nFlags );
+            if ( fd >= 0 )
+            {
+                // Grab the device exclusively so other processes (like the compositor)
+                // cannot read from it. This prevents input cross-talk between instances.
+                if ( ioctl( fd, EVIOCGRAB, 1 ) < 0 )
+                {
+                    fprintf( stderr, "[gamescope-splitux] Warning: Failed to grab device %s exclusively (errno=%d)\n",
+                             pszPath, errno );
+                }
+                else
+                {
+                    fprintf( stderr, "[gamescope-splitux] Grabbed device %s exclusively\n", pszPath );
+                }
+            }
+            return fd;
         },
 
         .close_restricted = []( int nFd, void *pUserData ) -> void
         {
+            // Release the grab before closing
+            ioctl( nFd, EVIOCGRAB, 0 );
             close( nFd );
         },
     };
@@ -84,18 +105,31 @@ namespace gamescope
                 return false;
             }
 
+            int nDevicesAdded = 0;
             for ( const auto& path : g_vecLibInputHoldDevices )
             {
+                fprintf( stderr, "[gamescope-splitux] Attempting to add input device: %s\n", path.c_str() );
                 libinput_device *pDevice = libinput_path_add_device( m_pLibInput, path.c_str() );
                 if ( pDevice )
                 {
+                    fprintf( stderr, "[gamescope-splitux] Successfully added input device: %s\n", path.c_str() );
                     log_input_stealer.infof( "Added input device: %s", path.c_str() );
+                    nDevicesAdded++;
                 }
                 else
                 {
+                    fprintf( stderr, "[gamescope-splitux] ERROR: Failed to add input device: %s (errno=%d: %s)\n",
+                             path.c_str(), errno, strerror(errno) );
                     log_input_stealer.errorf( "Failed to add input device: %s", path.c_str() );
                 }
             }
+
+            if ( nDevicesAdded == 0 )
+            {
+                fprintf( stderr, "[gamescope-splitux] ERROR: No input devices were successfully added! Input will not work.\n" );
+                return false;
+            }
+            fprintf( stderr, "[gamescope-splitux] LibInput initialized with %d device(s)\n", nDevicesAdded );
         }
         else
         {
@@ -129,6 +163,8 @@ namespace gamescope
     void CLibInputHandler::OnPollIn()
     {
         static uint32_t s_uSequence = 0;
+        static uint32_t s_nEventCount = 0;
+        static uint32_t s_nLastLoggedCount = 0;
 
         libinput_dispatch( m_pLibInput );
 
@@ -137,6 +173,19 @@ namespace gamescope
             defer( libinput_event_destroy( pEvent ) );
 
             libinput_event_type eEventType = libinput_event_get_type( pEvent );
+            s_nEventCount++;
+
+            // Log first event to confirm we're receiving data
+            if ( s_nEventCount == 1 )
+            {
+                fprintf( stderr, "[gamescope-splitux] LibInput: received FIRST event! (type=%d)\n", eEventType );
+            }
+            // Log every 100 events to show activity
+            else if ( s_nEventCount - s_nLastLoggedCount >= 100 )
+            {
+                fprintf( stderr, "[gamescope-splitux] LibInput: processed %u events (type=%d)\n", s_nEventCount, eEventType );
+                s_nLastLoggedCount = s_nEventCount;
+            }
 
             switch ( eEventType )
             {

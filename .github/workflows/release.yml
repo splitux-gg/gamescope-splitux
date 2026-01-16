@@ -4,6 +4,11 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Tag name for release (leave empty for build-only test)'
+        required: false
+        type: string
 
 permissions:
   contents: write
@@ -35,19 +40,39 @@ jobs:
           ninja -C build/
           strip build/src/gamescope build/src/gamescopectl build/src/gamescopereaper
 
+      - name: Get version
+        id: version
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            echo "tag=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+          elif [[ -n "${{ inputs.tag_name }}" ]]; then
+            echo "tag=${{ inputs.tag_name }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=" >> $GITHUB_OUTPUT
+          fi
+
       - name: Package
+        if: steps.version.outputs.tag != ''
         run: |
           mkdir -p release/bin
           cp build/src/gamescope release/bin/
           cp build/src/gamescopectl release/bin/
           cp build/src/gamescopereaper release/bin/
           cd release
-          zip -r ../gamescope-splitux-${{ github.ref_name }}.zip bin/
+          zip -r ../gamescope-splitux-${{ steps.version.outputs.tag }}.zip bin/
 
       - name: Create Release
+        if: steps.version.outputs.tag != ''
         uses: softprops/action-gh-release@v2
         with:
-          files: gamescope-splitux-${{ github.ref_name }}.zip
+          tag_name: ${{ steps.version.outputs.tag }}
+          files: gamescope-splitux-${{ steps.version.outputs.tag }}.zip
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build verification (no release)
+        if: steps.version.outputs.tag == ''
+        run: |
+          echo "Build completed successfully!"
+          ls -la build/src/gamescope build/src/gamescopectl build/src/gamescopereaper

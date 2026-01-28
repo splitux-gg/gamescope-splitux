@@ -17,6 +17,10 @@
 #include "wlserver.hpp"
 #include <SDL.h>
 #include <SDL_vulkan.h>
+#include <SDL_syswm.h>
+#ifdef SDL_VIDEO_DRIVER_WAYLAND
+#include <wayland-client.h>
+#endif
 #include "rendervulkan.hpp"
 #include "steamcompmgr.hpp"
 #include "Utils/Defer.h"
@@ -276,6 +280,16 @@ namespace gamescope
 			fprintf(stderr, "SDL_Vulkan_CreateSurface failed: %s", SDL_GetError	() );
 			return false;
 		}
+
+		// Wait for xdg_surface configure handshake (required by strict compositors like niri)
+#ifdef SDL_VIDEO_DRIVER_WAYLAND
+		SDL_SysWMinfo wmInfo;
+		SDL_VERSION(&wmInfo.version);
+		if (SDL_GetWindowWMInfo(m_pWindow, &wmInfo) && wmInfo.subsystem == SDL_SYSWM_WAYLAND) {
+			struct wl_display *display = wmInfo.info.wl.display;
+			wl_display_roundtrip(display);
+		}
+#endif
 
 		return true;
 	}

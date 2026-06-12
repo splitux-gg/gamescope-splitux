@@ -26,6 +26,11 @@ static std::atomic<struct pipewire_buffer *> out_buffer;
 // Pending buffer for steamcompmgr → PipeWire
 static std::atomic<struct pipewire_buffer *> in_buffer;
 
+// Number of buffers allocated for a connected consumer. >0 means a consumer has
+// linked and negotiated buffers; used to run the compositor capture while the
+// stream is still PAUSED so it can bootstrap to STREAMING.
+static std::atomic<int> s_nConsumerBuffers{0};
+
 // Requested capture size
 static uint32_t s_nRequestedWidth;
 static uint32_t s_nRequestedHeight;
@@ -325,6 +330,9 @@ static void stream_handle_state_changed(void *data, enum pw_stream_state old_str
 		}
 		state->streaming = false;
 		state->seq = 0;
+		// Activate so the stream can progress to STREAMING; we then clock the
+		// graph ourselves from run_pipewire via drive_capture().
+		pw_stream_set_active(state->stream, true);
 		break;
 	case PW_STREAM_STATE_STREAMING:
 		state->streaming = true;
@@ -371,7 +379,12 @@ static void stream_handle_param_changed(void *data, uint32_t id, const struct sp
 	uint8_t buf[1024];
 	struct spa_pod_builder builder = SPA_POD_BUILDER_INIT(buf, sizeof(buf));
 
-	int buffers = 4;
+	// 24 (was 4, range-capped 8): a zero-copy consumer (splitux-together
+	// seat-streamer) legitimately holds ~13 buffers in flight (8-frame release
+	// ring guarding the GPU encode race + decouple queue + encoder). With a
+	// 4-8 pool that starves capture ("out of buffers") and throttles the
+	// stream to ~70-100fps. 24 dmabufs @1080p NV12 ≈ 80MB — cheap.
+	int buffers = 24;
 	int shm_size = state->shm_stride * state->video_info.size.height;
 	if (state->video_info.format == SPA_VIDEO_FORMAT_NV12) {
 		shm_size += ((state->video_info.size.height + 1) / 2) * state->shm_stride;
@@ -381,7 +394,7 @@ static void stream_handle_param_changed(void *data, uint32_t id, const struct sp
 	const struct spa_pod *buffers_param =
 		(const struct spa_pod *) spa_pod_builder_add_object(&builder,
 		SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
-		SPA_PARAM_BUFFERS_buffers, SPA_POD_CHOICE_RANGE_Int(buffers, 1, 8),
+		SPA_PARAM_BUFFERS_buffers, SPA_POD_CHOICE_RANGE_Int(buffers, 1, 32),
 		SPA_PARAM_BUFFERS_blocks, SPA_POD_Int(1),
 		SPA_PARAM_BUFFERS_size, SPA_POD_Int(shm_size),
 		SPA_PARAM_BUFFERS_stride, SPA_POD_Int(state->shm_stride),
@@ -580,6 +593,8 @@ static void stream_handle_add_buffer(void *user_data, struct pw_buffer *pw_buffe
 
 	pw_buffer->user_data = buffer;
 
+	s_nConsumerBuffers.fetch_add(1, std::memory_order_relaxed);
+
 	return;
 
 error:
@@ -590,11 +605,23 @@ static void stream_handle_remove_buffer(void *data, struct pw_buffer *pw_buffer)
 {
 	struct pipewire_buffer *buffer = (struct pipewire_buffer *) pw_buffer->user_data;
 
+	s_nConsumerBuffers.fetch_sub(1, std::memory_order_relaxed);
+
 	buffer->buffer = nullptr;
 
 	if (!buffer->copying) {
 		destroy_buffer(buffer);
 	}
+}
+
+// We are a DRIVER node; the buffer lifecycle (dequeue→paint→copy→queue) is
+// handled by the compositor push path (paint_pipewire → push_pipewire_buffer →
+// dispatch_nudge → pw_stream_queue_buffer). The driver cycles we schedule from
+// drive_capture() deliver those queued buffers. .process must exist for the
+// driver but does the producing elsewhere, so it is a no-op here.
+static void stream_handle_process(void *data)
+{
+	(void) data;
 }
 
 static const struct pw_stream_events stream_events = {
@@ -603,55 +630,58 @@ static const struct pw_stream_events stream_events = {
 	.param_changed = stream_handle_param_changed,
 	.add_buffer = stream_handle_add_buffer,
 	.remove_buffer = stream_handle_remove_buffer,
-	.process = nullptr,
+	.process = stream_handle_process,
 };
 
-enum pipewire_event_type {
-	EVENT_PIPEWIRE,
-	EVENT_NUDGE,
-	EVENT_COUNT // keep last
-};
+// We connect as a PW_STREAM_FLAG_DRIVER node, so we must schedule the graph's
+// cycles ourselves. This runs once per loop iteration (~60Hz); each trigger
+// drives one cycle that delivers a queued capture buffer to the consumer.
+// Driving is what moves the stream PAUSED→STREAMING and keeps it clocked under
+// a session manager that does not otherwise provide a clock for a video-only
+// graph (e.g. WirePlumber; on the Steam Deck the node is activated for us).
+static void drive_capture(struct pipewire_state *state)
+{
+	if (pw_stream_is_driving(state->stream))
+		pw_stream_trigger_process(state->stream);
+}
+
+// Service the nudge self-pipe (steamcompmgr → PipeWire) as a loop io source so
+// a single pw_loop_iterate() drives everything on one thread.
+static void nudge_io_event(void *data, int fd, uint32_t mask)
+{
+	(void) mask;
+	struct pipewire_state *state = (struct pipewire_state *) data;
+	dispatch_nudge(state, fd);
+}
 
 static void run_pipewire(struct pipewire_state *state)
 {
 	pthread_setname_np( pthread_self(), "gamescope-pw" );
 
-	struct pollfd pollfds[] = {
-		[EVENT_PIPEWIRE] = {
-			.fd = pw_loop_get_fd(state->loop),
-			.events = POLLIN,
-		},
-		[EVENT_NUDGE] = {
-			.fd = nudgePipe[0],
-			.events = POLLIN,
-		},
-	};
+	// The pw_loop must be iterated from a single thread; doing the node-id wait
+	// here (rather than in init_pipewire on the main thread) keeps all iteration
+	// on this thread, which is required for pw_loop_iterate() timeouts and
+	// driving to work.
+	while (state->running && state->stream_node_id == SPA_ID_INVALID) {
+		if (pw_loop_iterate(state->loop, -1) < 0) {
+			pwr_log.errorf("pw_loop_iterate failed");
+			return;
+		}
+	}
+	pwr_log.infof("stream available on node ID: %u", state->stream_node_id);
 
+	pw_loop_add_io(state->loop, nudgePipe[0], SPA_IO_IN, false, nudge_io_event, state);
+
+	// Iterate with a finite timeout so we get a ~60Hz cadence (services pw
+	// events, the nudge pipe, and any delivered buffers), then drive a graph
+	// cycle. This decoupled drive is what keeps the capture clocked.
 	while (state->running) {
-		int ret = poll(pollfds, EVENT_COUNT, -1);
+		int ret = pw_loop_iterate(state->loop, 16);
 		if (ret < 0) {
-			pwr_log.errorf_errno("poll failed");
+			pwr_log.errorf("pw_loop_iterate failed");
 			break;
 		}
-
-		if (pollfds[EVENT_PIPEWIRE].revents & POLLHUP) {
-			pwr_log.errorf("lost connection to server");
-			break;
-		}
-
-		assert(!(pollfds[EVENT_NUDGE].revents & POLLHUP));
-
-		if (pollfds[EVENT_PIPEWIRE].revents & POLLIN) {
-			ret = pw_loop_iterate(state->loop, -1);
-			if (ret < 0) {
-				pwr_log.errorf("pw_loop_iterate failed");
-				break;
-			}
-		}
-
-		if (pollfds[EVENT_NUDGE].revents & POLLIN) {
-			dispatch_nudge(state, nudgePipe[0]);
-		}
+		drive_capture(state);
 	}
 
 	pwr_log.infof("exiting");
@@ -712,7 +742,11 @@ bool init_pipewire(void)
 	struct spa_pod_builder builder = SPA_POD_BUILDER_INIT(buf, sizeof(buf));
 	std::vector<const struct spa_pod *> format_params = build_format_params(&builder);
 
-	enum pw_stream_flags flags = (enum pw_stream_flags)(PW_STREAM_FLAG_DRIVER | PW_STREAM_FLAG_ALLOC_BUFFERS);
+	// Self-clocking driver: DRIVER so we own the graph clock (set_active on
+	// PAUSED + drive_capture() trigger cycles), INACTIVE so activation is
+	// explicit. This is what lets the capture run under a generic session
+	// manager (WirePlumber), not only the Steam Deck's.
+	enum pw_stream_flags flags = (enum pw_stream_flags)(PW_STREAM_FLAG_DRIVER | PW_STREAM_FLAG_ALLOC_BUFFERS | PW_STREAM_FLAG_INACTIVE);
 	int ret = pw_stream_connect(state->stream, PW_DIRECTION_OUTPUT, PW_ID_ANY, flags, format_params.data(), format_params.size());
 	if (ret != 0) {
 		pwr_log.errorf("pw_stream_connect failed");
@@ -720,16 +754,9 @@ bool init_pipewire(void)
 	}
 
 	state->running = true;
-	while (state->stream_node_id == SPA_ID_INVALID) {
-		int ret = pw_loop_iterate(state->loop, -1);
-		if (ret < 0) {
-			pwr_log.errorf("pw_loop_iterate failed");
-			return false;
-		}
-	}
 
-	pwr_log.infof("stream available on node ID: %u", state->stream_node_id);
-
+	// Do NOT iterate the loop here: it must be iterated on a single thread, so
+	// the node-id wait happens inside run_pipewire on the pw thread instead.
 	std::thread thread(run_pipewire, state);
 	thread.detach();
 
@@ -747,10 +774,18 @@ bool pipewire_is_streaming()
 	return state->streaming;
 }
 
+bool pipewire_has_consumer()
+{
+	return s_nConsumerBuffers.load(std::memory_order_relaxed) > 0;
+}
+
 struct pipewire_buffer *dequeue_pipewire_buffer(void)
 {
 	struct pipewire_state *state = &pipewire_state;
-	if (state->streaming) {
+	// Produce while streaming, or while a consumer's buffers exist but the
+	// stream is still PAUSED — the latter bootstraps the DRIVER stream to
+	// STREAMING (its first queued frame completes the handshake).
+	if (state->streaming || pipewire_has_consumer()) {
 		request_buffer(state);
 	}
 	return out_buffer.exchange(nullptr);

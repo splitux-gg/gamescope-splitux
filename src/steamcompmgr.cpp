@@ -1722,6 +1722,10 @@ int MouseCursor::y() const
 	return m_y;
 }
 
+extern const char* g_customCursorPath;
+extern int g_customCursorHotspotX;
+extern int g_customCursorHotspotY;
+
 bool MouseCursor::getTexture()
 {
 	uint64_t ulConnectorId = 0;
@@ -1736,6 +1740,66 @@ bool MouseCursor::getTexture()
 
 	if (!m_dirty) {
 		return !m_imageEmpty;
+	}
+
+	// splitux: --cursor FORCES this image — never consult the app/X cursor.
+	// Games inside the nested Xwayland (no cursor theme, virtual input) often
+	// install an EMPTY cursor; following it via the XFixes fetch below hides
+	// the cursor permanently while it still hit-tests. Load the PNG directly
+	// and build the texture from it, independent of any X server state.
+	if (g_customCursorPath)
+	{
+		int w, h, channels;
+		unsigned char *data = stbi_load(g_customCursorPath, &w, &h, &channels, STBI_rgb_alpha);
+		if (data)
+		{
+			glm::uvec2 surfaceSize = GetBackend()->CursorSurfaceSize( glm::uvec2{ (uint32_t)w, (uint32_t)h } );
+			uint32_t sw = surfaceSize.x, sh = surfaceSize.y;
+			std::vector<uint32_t> cursorBuffer(sw * sh, 0);
+			for (int i = 0; i < h; i++)
+			{
+				for (int j = 0; j < w; j++)
+				{
+					const unsigned char *p = data + (i * w + j) * 4;  // stbi RGBA
+					uint32_t a = p[3];
+					// premultiplied 0xAARRGGBB (DRM_FORMAT_ARGB8888)
+					cursorBuffer[i * sw + j] = (a << 24) |
+						((p[0] * a / 255u) << 16) |
+						((p[1] * a / 255u) << 8) |
+						(p[2] * a / 255u);
+				}
+			}
+			stbi_image_free(data);
+
+			m_hotspotX = g_customCursorHotspotX;
+			m_hotspotY = g_customCursorHotspotY;
+			m_imageEmpty = false;
+			m_dirty = false;
+			updateCursorFeedback();
+
+			CVulkanTexture::createFlags texCreateFlags;
+			texCreateFlags.bFlippable = true;
+			if ( GetBackend()->SupportsPlaneHardwareCursor() )
+				texCreateFlags.bLinear = true;
+			m_texture = vulkan_create_texture_from_bits(sw, sh, w, h,
+				DRM_FORMAT_ARGB8888, texCreateFlags, cursorBuffer.data());
+
+			if ( GetBackend()->GetCurrentConnector() && GetBackend()->GetCurrentConnector()->GetNestedHints() )
+			{
+				auto info = std::make_shared<gamescope::INestedHints::CursorInfo>(
+					gamescope::INestedHints::CursorInfo
+					{
+						.pPixels   = std::move( cursorBuffer ),
+						.uWidth    = (uint32_t) w,
+						.uHeight   = (uint32_t) h,
+						.uXHotspot = (uint32_t) m_hotspotX,
+						.uYHotspot = (uint32_t) m_hotspotY,
+					});
+				GetBackend()->GetCurrentConnector()->GetNestedHints()->SetCursorImage( std::move( info ) );
+			}
+			return m_texture != nullptr;
+		}
+		xwm_log.errorf("--cursor: failed to load %s (falling through to app cursor)", g_customCursorPath);
 	}
 
 	auto *image = XFixesGetCursorImage(m_ctx->dpy);
@@ -2299,6 +2363,8 @@ static void paint_pipewire()
 	if ( !s_pPipewireBuffer )
 		s_pPipewireBuffer = dequeue_pipewire_buffer();
 
+	{ static int e = 0; if ( ( e++ % 60 ) == 0 ) xwm_log.infof( "paint_pipewire: ENTER (buf=%p)", (void*)s_pPipewireBuffer ); }
+
 	if ( !s_pPipewireBuffer || !s_pPipewireBuffer->texture )
 		return;
 
@@ -2344,12 +2410,16 @@ static void paint_pipewire()
 		pFocus = GetCurrentFocus();
 	}
 
-	if ( !pFocus->focusWindow )
+	if ( !pFocus->focusWindow ) {
+		static int n = 0; if ( ( n++ % 60 ) == 0 ) xwm_log.infof( "paint_pipewire: RETURN no focusWindow (ulFocusAppId=%lu)", ulFocusAppId );
 		return;
+	}
 
 	const bool bAppIdMatches = !ulFocusAppId || pFocus->focusWindow->appID == ulFocusAppId;
-	if ( !bAppIdMatches )
+	if ( !bAppIdMatches ) {
+		static int n = 0; if ( ( n++ % 60 ) == 0 ) xwm_log.infof( "paint_pipewire: RETURN appid mismatch (win appID=%u want=%lu)", pFocus->focusWindow->appID, ulFocusAppId );
 		return;
+	}
 
 	// If the commits are the same as they were last time, don't repaint and don't push a new buffer on the stream.
 	static uint64_t s_ulLastFocusCommitId = 0;
@@ -2359,8 +2429,10 @@ static void paint_pipewire()
 	uint64_t ulOverrideCommitId = window_last_done_commit_id( pFocus->overrideWindow );
 
 	if ( ulFocusCommitId == s_ulLastFocusCommitId &&
-	     ulOverrideCommitId == s_ulLastOverrideCommitId )
+	     ulOverrideCommitId == s_ulLastOverrideCommitId ) {
+		static int n = 0; if ( ( n++ % 120 ) == 0 ) xwm_log.infof( "paint_pipewire: RETURN no commit change (focusCommit=%lu)", ulFocusCommitId );
 		return;
+	}
 
 	s_ulLastFocusCommitId = ulFocusCommitId;
 	s_ulLastOverrideCommitId = ulOverrideCommitId;
@@ -2382,6 +2454,22 @@ static void paint_pipewire()
 	if ( pFocus->overrideWindow && !pFocus->focusWindow->isSteamStreamingClient )
 		paint_window( pFocus->overrideWindow, pFocus->focusWindow, &frameInfo, nullptr, PaintWindowFlag::NoFilter, 1.0f, pFocus->overrideWindow );
 
+	// splitux: composite the cursor into the capture. Upstream paint_pipewire
+	// never draws the cursor plane, so streamed seats (whose only view IS this
+	// capture) get an invisible-but-hit-testing cursor regardless of any cursor
+	// image fixes on the local-display path. Mirror paint_all's cursor draw;
+	// s_PipewireFocus has no cursor object, so fall back to the live focus'.
+	{
+		// Deliberately NOT gated on ShouldDrawCursor(): that returns false when
+		// NESTED (the host compositor draws the cursor via nested hints), which
+		// is right for the local window but wrong for this capture — the stream
+		// viewer has no host cursor. paint() itself still honors hide-on-idle
+		// (wlserver.bCursorHidden) and empty cursor images.
+		MouseCursor *pStreamCursor = steamcompmgr_get_current_cursor();
+		if ( pStreamCursor )
+			pStreamCursor->paint( pFocus->focusWindow, pFocus->overrideWindow, &frameInfo );
+	}
+
 	gamescope::Rc<CVulkanTexture> pRGBTexture = s_pPipewireBuffer->texture->isYcbcr()
 		? vulkan_acquire_screenshot_texture( uWidth, uHeight, false, DRM_FORMAT_XRGB2101010 )
 		: gamescope::Rc<CVulkanTexture>{ s_pPipewireBuffer->texture };
@@ -2392,6 +2480,18 @@ static void paint_pipewire()
 	std::optional<uint64_t> oPipewireSequence = vulkan_screenshot( &frameInfo, pRGBTexture, pYUVTexture );
 	// If we ever want the fat compositing path, use this.
 	//std::optional<uint64_t> oPipewireSequence = vulkan_composite( &frameInfo, s_pPipewireBuffer->texture, false, pRGBTexture, false );
+
+	// [splitux-together debug] understand black capture
+	{
+		static int s_pwDbg = 0;
+		if ( ( s_pwDbg++ % 60 ) == 0 )
+			xwm_log.infof( "paint_pipewire dbg: focusWin=%p appID=%u layers=%d tex=%ux%u g_nOutput=%ux%u screenshot=%s",
+				(void*)pFocus->focusWindow,
+				pFocus->focusWindow ? pFocus->focusWindow->appID : 0,
+				frameInfo.layerCount, uWidth, uHeight,
+				g_nOutputWidth, g_nOutputHeight,
+				oPipewireSequence ? "ok" : "FAIL" );
+	}
 
 	g_uCompositeDebug = uCompositeDebugBackup;
 
@@ -8782,7 +8882,7 @@ steamcompmgr_main(int argc, char **argv)
 			GetVBlankTimer().ArmNextVBlank( true );
 
 #if HAVE_PIPEWIRE
-			if ( pipewire_is_streaming() )
+			if ( pipewire_is_streaming() || pipewire_has_consumer() )
 				paint_pipewire();
 #endif
 		}

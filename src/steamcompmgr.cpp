@@ -2368,6 +2368,23 @@ static void paint_pipewire()
 	if ( !s_pPipewireBuffer || !s_pPipewireBuffer->texture )
 		return;
 
+	// splitux: defensive guard against a SIGSEGV inside RADV. During consumer
+	// connect/disconnect renegotiation a live pipewire buffer can surface whose
+	// CVulkanTexture has no valid VkImage (vkImage() == VK_NULL_HANDLE). The
+	// capture path (vulkan_screenshot) dispatches a compute shader and builds a
+	// pipeline barrier with `.image = texture->vkImage()`; a null handle makes
+	// vkCmdPipelineBarrier dereference null and crash the compositor
+	// (insertBarrier -> CmdPipelineBarrier, libvulkan_radeon). Skip this frame
+	// rather than dispatch into it — the buffer is reaped via IsStale() once the
+	// stream finishes tearing it down, and a fresh one is dequeued next frame.
+	if ( s_pPipewireBuffer->texture->vkImage() == VK_NULL_HANDLE )
+	{
+		static int s_nNullImg = 0;
+		if ( ( s_nNullImg++ % 60 ) == 0 )
+			xwm_log.infof( "paint_pipewire: skipping frame — capture texture has no VkImage (stream renegotiating?)" );
+		return;
+	}
+
 	struct FrameInfo_t frameInfo = {};
 	frameInfo.applyOutputColorMgmt = true;
 	frameInfo.outputEncodingEOTF   = EOTF_Gamma22;

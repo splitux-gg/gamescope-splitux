@@ -1,21 +1,22 @@
 #pragma once
 
+#include <atomic>
 #include <memory>
 #include <pipewire/pipewire.h>
+#include <pipewire/thread-loop.h>
 #include <spa/param/video/format-utils.h>
 
 #include "rendervulkan.hpp"
 #include "pipewire_gamescope.hpp"
 
 struct pipewire_state {
-	struct pw_loop *loop;
+	struct pw_thread_loop *thread_loop;
 	struct pw_context *context;
 	struct pw_core *core;
 	bool running;
 
 	struct pw_stream *stream;
-	struct spa_source *drive_timer;
-	uint32_t stream_node_id;
+	std::atomic<uint32_t> stream_node_id;
 	std::atomic<bool> streaming;
 	struct spa_video_info_raw video_info;
 	struct spa_gamescope gamescope_info;
@@ -27,8 +28,11 @@ struct pipewire_state {
 
 /**
  * PipeWire buffers are allocated by the PipeWire thread, and are temporarily
- * shared with the steamcompmgr thread (via dequeue_pipewire_buffer and
- * push_pipewire_buffer) for copying.
+ * lent to the steamcompmgr thread (via pipewire_dequeue_buffer and
+ * pipewire_submit_buffer) for rendering+copying. Every access to the pipewire
+ * buffer pool — dequeue, queue, trigger, add_buffer, remove_buffer — happens
+ * under the thread-loop lock, so the two threads can never touch the pool
+ * concurrently.
  */
 struct pipewire_buffer {
 	enum spa_data_type type; // SPA_DATA_MemFd or SPA_DATA_DmaBuf
@@ -43,25 +47,22 @@ struct pipewire_buffer {
 		int fd;
 	} shm;
 
-	// The following fields are not thread-safe
+	// The PipeWire buffer, or nullptr if remove_buffer has detached it. Only
+	// read/written under the thread-loop lock.
+	struct pw_buffer *buffer;
 
-	// The PipeWire buffer, or nullptr if it's been destroyed.
-	std::atomic<struct pw_buffer *> buffer;
-	bool IsStale() const 
-	{
-		return buffer == nullptr;
-	}
-	// We pass the buffer to the steamcompmgr thread for copying. This is set
-	// to true if the buffer is currently owned by the steamcompmgr thread.
-	bool copying;
+	// True while the steamcompmgr (producer) thread holds this buffer for
+	// render+copy. Only read/written under the thread-loop lock. The producer
+	// runs its GPU work with the lock released, so remove_buffer consults this
+	// flag to decide free-now vs defer-to-producer.
+	bool in_producer;
 };
 
 bool init_pipewire(void);
+void deinit_pipewire(void);
 uint32_t get_pipewire_stream_node_id(void);
-struct pipewire_buffer *dequeue_pipewire_buffer(void);
+struct pipewire_buffer *pipewire_dequeue_buffer(void);
+void pipewire_submit_buffer(struct pipewire_buffer *buffer);
 bool pipewire_is_streaming();
 bool pipewire_has_consumer();
 void pipewire_destroy_buffer(struct pipewire_buffer *buffer);
-bool pipewire_reap_if_stale(struct pipewire_buffer *buffer);
-void push_pipewire_buffer(struct pipewire_buffer *buffer);
-void nudge_pipewire(void);

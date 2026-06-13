@@ -7,8 +7,6 @@
 #include <unistd.h>
 
 #include <atomic>
-#include <mutex>
-#include <thread>
 #include <vector>
 
 #include "main.hpp"
@@ -20,26 +18,11 @@
 static LogScope pwr_log("pipewire");
 
 static struct pipewire_state pipewire_state = { .stream_node_id = SPA_ID_INVALID };
-static int nudgePipe[2] = { -1, -1 };
-
-// Pending buffer for PipeWire → steamcompmgr
-static std::atomic<struct pipewire_buffer *> out_buffer;
-// Pending buffer for steamcompmgr → PipeWire
-static std::atomic<struct pipewire_buffer *> in_buffer;
-
-// splitux: serializes the pipewire_buffer ownership token (`copying`) and every
-// free-decision site so the steamcompmgr and pipewire threads can't both free a
-// buffer. The token write in request_buffer (steamcompmgr) was previously a
-// plain cross-thread bool read by remove_buffer (pipewire); a stale read let
-// remove_buffer free a buffer steamcompmgr still held, which then double-freed
-// via paint_pipewire's stale reap → garbage type → assert(false) SIGABRT. The
-// lock is held only for cheap pointer bookkeeping (never across GPU work or a
-// destroy), so it cannot deadlock against the capture/encode path.
-static std::mutex s_bufferMutex;
 
 // Number of buffers allocated for a connected consumer. >0 means a consumer has
 // linked and negotiated buffers; used to run the compositor capture while the
-// stream is still PAUSED so it can bootstrap to STREAMING.
+// stream is still PAUSED so it can bootstrap to STREAMING. Mutated only from the
+// loop thread (add_buffer/remove_buffer), read from the steamcompmgr thread.
 static std::atomic<int> s_nConsumerBuffers{0};
 
 // Requested capture size
@@ -51,11 +34,11 @@ static uint32_t s_nOutputWidth;
 static uint32_t s_nOutputHeight;
 
 static void destroy_buffer(struct pipewire_buffer *buffer) {
-	// splitux: these were asserts. The ownership protocol (s_bufferMutex +
-	// `copying`) now guarantees a buffer is freed exactly once, with its
-	// pw_buffer already detached — so neither condition below should ever hold.
-	// But for a live demo, degrade a never-expected residual race to a logged
-	// leak instead of a SIGABRT that kills the compositor mid-session.
+	// The ownership protocol (every pool call under the thread-loop lock +
+	// in_producer) now guarantees a buffer is freed exactly once, with its
+	// pw_buffer already detached — so neither guard below should ever fire.
+	// Kept as belt-and-suspenders: degrade a never-expected residual race to a
+	// logged leak instead of a SIGABRT that kills the compositor mid-session.
 	if (buffer->buffer != nullptr) {
 		pwr_log.errorf("destroy_buffer: pw_buffer still attached (race?) — leaking buffer");
 		return;
@@ -79,37 +62,12 @@ static void destroy_buffer(struct pipewire_buffer *buffer) {
 		return;
 	}
 
-	// If out_buffer == buffer, then set it to nullptr.
-	// We don't care about the result.
-	struct pipewire_buffer *buffer1 = buffer;
-	out_buffer.compare_exchange_strong(buffer1, nullptr);
-	struct pipewire_buffer *buffer2 = buffer;
-	in_buffer.compare_exchange_strong(buffer2, nullptr);
-
 	delete buffer;
 }
 
 void pipewire_destroy_buffer(struct pipewire_buffer *buffer)
 {
 	destroy_buffer(buffer);
-}
-
-// splitux: called by the steamcompmgr thread for a buffer it currently owns
-// (copying == true) when it suspects the stream tore down the underlying
-// pw_buffer. Under s_bufferMutex this is serialized with the pipewire thread's
-// remove_buffer: observing buffer->buffer == nullptr here means remove_buffer
-// already ran to completion and — seeing copying == true — left this buffer for
-// us, so we are its sole owner and free it. Returns true iff destroyed (caller
-// must then drop its pointer). If not stale, the buffer is still live; keep it.
-bool pipewire_reap_if_stale(struct pipewire_buffer *buffer)
-{
-	{
-		std::lock_guard<std::mutex> lock(s_bufferMutex);
-		if (buffer->buffer != nullptr)
-			return false;
-	}
-	destroy_buffer(buffer);
-	return true;
 }
 
 static void calculate_capture_size()
@@ -208,28 +166,27 @@ static std::vector<const struct spa_pod *> build_format_params(struct spa_pod_bu
 	return params;
 }
 
-static void request_buffer(struct pipewire_state *state)
+// Fold in any output-size change that happened since the last frame and, if the
+// resulting capture size differs from the negotiated format, renegotiate. Must
+// be called with the thread-loop lock held (it touches the stream params).
+static void maybe_renegotiate_size_locked(struct pipewire_state *state)
 {
-	// splitux: hold s_bufferMutex across the dequeue, the copying=true mark, and
-	// the publish so this is atomic w.r.t. remove_buffer's free decision. Either
-	// remove_buffer sees copying==true and leaves the buffer for us, or it ran
-	// first and freed it (in which case dequeue won't hand the removed buffer
-	// back). Closes the window where a stale copying read double-freed.
-	std::lock_guard<std::mutex> lock(s_bufferMutex);
-
-	struct pw_buffer *pw_buffer = pw_stream_dequeue_buffer(state->stream);
-	if (!pw_buffer) {
-		pwr_log.errorf("warning: out of buffers");
-		return;
+	if (g_nOutputWidth != s_nOutputWidth || g_nOutputHeight != s_nOutputHeight) {
+		s_nOutputWidth = g_nOutputWidth;
+		s_nOutputHeight = g_nOutputHeight;
+		calculate_capture_size();
 	}
+	if (s_nCaptureWidth != state->video_info.size.width || s_nCaptureHeight != state->video_info.size.height) {
+		pwr_log.debugf("renegotiating stream params (size: %dx%d)", s_nCaptureWidth, s_nCaptureHeight);
 
-	struct pipewire_buffer *buffer = (struct pipewire_buffer *) pw_buffer->user_data;
-	buffer->copying = true;
-
-	// Past this exchange, the PipeWire thread shares the buffer with the
-	// steamcompmgr thread
-	struct pipewire_buffer *old = out_buffer.exchange(buffer);
-	assert(old == nullptr);
+		uint8_t buf[4096];
+		struct spa_pod_builder builder = SPA_POD_BUILDER_INIT(buf, sizeof(buf));
+		std::vector<const struct spa_pod *> format_params = build_format_params(&builder);
+		int ret = pw_stream_update_params(state->stream, format_params.data(), format_params.size());
+		if (ret < 0) {
+			pwr_log.errorf("pw_stream_update_params failed");
+		}
+	}
 }
 
 static void copy_buffer(struct pipewire_state *state, struct pipewire_buffer *buffer)
@@ -314,61 +271,6 @@ static void copy_buffer(struct pipewire_state *state, struct pipewire_buffer *bu
 	}
 }
 
-static void dispatch_nudge(struct pipewire_state *state, int fd)
-{
-	while (true) {
-		static char buf[1024];
-		if (read(fd, buf, sizeof(buf)) < 0) {
-			if (errno != EAGAIN)
-				pwr_log.errorf_errno("dispatch_nudge: read failed");
-			break;
-		}
-	}
-
-	if (g_nOutputWidth != s_nOutputWidth || g_nOutputHeight != s_nOutputHeight) {
-		s_nOutputWidth = g_nOutputWidth;
-		s_nOutputHeight = g_nOutputHeight;
-		calculate_capture_size();
-	}
-	if (s_nCaptureWidth != state->video_info.size.width || s_nCaptureHeight != state->video_info.size.height) {
-		pwr_log.debugf("renegotiating stream params (size: %dx%d)", s_nCaptureWidth, s_nCaptureHeight);
-
-		uint8_t buf[4096];
-		struct spa_pod_builder builder = SPA_POD_BUILDER_INIT(buf, sizeof(buf));
-		std::vector<const struct spa_pod *> format_params = build_format_params(&builder);
-		int ret = pw_stream_update_params(state->stream, format_params.data(), format_params.size());
-		if (ret < 0) {
-			pwr_log.errorf("pw_stream_update_params failed");
-		}
-	}
-
-	struct pipewire_buffer *buffer = in_buffer.exchange(nullptr);
-	if (buffer != nullptr) {
-		// We now completely own the buffer, it's no longer shared with the
-		// steamcompmgr thread. Clear the ownership token and sample staleness
-		// under the lock so this is ordered against remove_buffer (both run on
-		// this pw thread, so they can't interleave, but request_buffer on the
-		// steamcompmgr thread reads/writes copying under the same lock).
-		bool stale;
-		{
-			std::lock_guard<std::mutex> lock(s_bufferMutex);
-			buffer->copying = false;
-			stale = (buffer->buffer == nullptr);
-		}
-
-		if (!stale) {
-			copy_buffer(state, buffer);
-
-			int ret = pw_stream_queue_buffer(state->stream, buffer->buffer);
-			if (ret < 0) {
-				pwr_log.errorf("pw_stream_queue_buffer failed");
-			}
-		} else {
-			destroy_buffer(buffer);
-		}
-	}
-}
-
 static void stream_handle_state_changed(void *data, enum pw_stream_state old_stream_state, enum pw_stream_state stream_state, const char *error)
 {
 	struct pipewire_state *state = (struct pipewire_state *) data;
@@ -379,11 +281,13 @@ static void stream_handle_state_changed(void *data, enum pw_stream_state old_str
 	case PW_STREAM_STATE_PAUSED:
 		if (state->stream_node_id == SPA_ID_INVALID) {
 			state->stream_node_id = pw_stream_get_node_id(state->stream);
+			pwr_log.infof("stream available on node ID: %u", state->stream_node_id.load());
 		}
 		state->streaming = false;
 		state->seq = 0;
 		// Activate so the stream can progress to STREAMING; we then clock the
-		// graph ourselves from run_pipewire via drive_capture().
+		// graph ourselves, one cycle per produced frame, from
+		// pipewire_submit_buffer() via pw_stream_trigger_process().
 		pw_stream_set_active(state->stream, true);
 		break;
 	case PW_STREAM_STATE_STREAMING:
@@ -431,12 +335,14 @@ static void stream_handle_param_changed(void *data, uint32_t id, const struct sp
 	uint8_t buf[1024];
 	struct spa_pod_builder builder = SPA_POD_BUILDER_INIT(buf, sizeof(buf));
 
-	// 24 (was 4, range-capped 8): a zero-copy consumer (splitux-together
-	// seat-streamer) legitimately holds ~13 buffers in flight (8-frame release
-	// ring guarding the GPU encode race + decouple queue + encoder). With a
-	// 4-8 pool that starves capture ("out of buffers") and throttles the
-	// stream to ~70-100fps. 24 dmabufs @1080p NV12 ≈ 80MB — cheap.
-	int buffers = 24;
+	// 48 (range max 64): in-flight buffer depth scales with capture fps. At the
+	// 200fps tier the producer's render depth plus a zero-copy consumer
+	// (splitux-together seat-streamer, va+always-copy) holding frames briefly
+	// can otherwise starve capture ("out of buffers") and throttle the stream.
+	// The SPA_POD_CHOICE_RANGE_Int max silently caps any larger request, so it
+	// must be raised in lockstep. 48 dmabufs @1080p NV12 ≈ 160MB. min=1 lets
+	// reneg shrink the pool.
+	int buffers = 48;
 	int shm_size = state->shm_stride * state->video_info.size.height;
 	if (state->video_info.format == SPA_VIDEO_FORMAT_NV12) {
 		shm_size += ((state->video_info.size.height + 1) / 2) * state->shm_stride;
@@ -446,7 +352,7 @@ static void stream_handle_param_changed(void *data, uint32_t id, const struct sp
 	const struct spa_pod *buffers_param =
 		(const struct spa_pod *) spa_pod_builder_add_object(&builder,
 		SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
-		SPA_PARAM_BUFFERS_buffers, SPA_POD_CHOICE_RANGE_Int(buffers, 1, 32),
+		SPA_PARAM_BUFFERS_buffers, SPA_POD_CHOICE_RANGE_Int(buffers, 1, 64),
 		SPA_PARAM_BUFFERS_blocks, SPA_POD_Int(1),
 		SPA_PARAM_BUFFERS_size, SPA_POD_Int(shm_size),
 		SPA_PARAM_BUFFERS_stride, SPA_POD_Int(state->shm_stride),
@@ -659,30 +565,23 @@ static void stream_handle_remove_buffer(void *data, struct pw_buffer *pw_buffer)
 
 	s_nConsumerBuffers.fetch_sub(1, std::memory_order_relaxed);
 
-	// Detach the pw_buffer and decide ownership atomically w.r.t. the
-	// steamcompmgr thread. If it's currently copying this buffer, it owns it and
-	// will free it (via dispatch_nudge reclaim or paint_pipewire's stale reap);
-	// only free here if the pw thread still owns it. Freeing is done outside the
-	// lock (delete runs the CVulkanTexture destructor) — once we've decided to
-	// free, copying==false means steamcompmgr isn't referencing it, so we're the
-	// sole owner.
-	bool destroy;
-	{
-		std::lock_guard<std::mutex> lock(s_bufferMutex);
-		buffer->buffer = nullptr;
-		destroy = !buffer->copying;
-	}
-
-	if (destroy) {
+	// Runs on the loop thread with the thread-loop lock effectively held, so it
+	// is serialized against pipewire_dequeue_buffer/pipewire_submit_buffer.
+	// Detach the pw_buffer. If the producer is mid-render with it
+	// (in_producer == true), leave the free to its submit; otherwise we are the
+	// sole owner and free now. destroy_buffer runs the CVulkanTexture dtor, but
+	// no GPU work is in flight for a buffer the producer isn't holding.
+	buffer->buffer = nullptr;
+	if (!buffer->in_producer) {
 		destroy_buffer(buffer);
 	}
 }
 
-// We are a DRIVER node; the buffer lifecycle (dequeue→paint→copy→queue) is
-// handled by the compositor push path (paint_pipewire → push_pipewire_buffer →
-// dispatch_nudge → pw_stream_queue_buffer). The driver cycles we schedule from
-// drive_capture() deliver those queued buffers. .process must exist for the
-// driver but does the producing elsewhere, so it is a no-op here.
+// We are a DRIVER node, so we must schedule the graph's cycles ourselves. With
+// the thread-loop design this is demand-driven: pipewire_submit_buffer()
+// triggers exactly one cycle per produced frame, so delivery rate == production
+// rate with no fixed cadence. .process must exist for the driver but the
+// producing happens on the steamcompmgr thread, so it is a no-op here.
 static void stream_handle_process(void *data)
 {
 	(void) data;
@@ -697,82 +596,21 @@ static const struct pw_stream_events stream_events = {
 	.process = stream_handle_process,
 };
 
-// We connect as a PW_STREAM_FLAG_DRIVER node, so we must schedule the graph's
-// cycles ourselves. This runs once per loop iteration (~60Hz); each trigger
-// drives one cycle that delivers a queued capture buffer to the consumer.
-// Driving is what moves the stream PAUSED→STREAMING and keeps it clocked under
-// a session manager that does not otherwise provide a clock for a video-only
-// graph (e.g. WirePlumber; on the Steam Deck the node is activated for us).
-static void drive_capture(struct pipewire_state *state)
-{
-	if (pw_stream_is_driving(state->stream))
-		pw_stream_trigger_process(state->stream);
-}
-
-// Service the nudge self-pipe (steamcompmgr → PipeWire) as a loop io source so
-// a single pw_loop_iterate() drives everything on one thread.
-static void nudge_io_event(void *data, int fd, uint32_t mask)
-{
-	(void) mask;
-	struct pipewire_state *state = (struct pipewire_state *) data;
-	dispatch_nudge(state, fd);
-}
-
-static void run_pipewire(struct pipewire_state *state)
-{
-	pthread_setname_np( pthread_self(), "gamescope-pw" );
-
-	// The pw_loop must be iterated from a single thread; doing the node-id wait
-	// here (rather than in init_pipewire on the main thread) keeps all iteration
-	// on this thread, which is required for pw_loop_iterate() timeouts and
-	// driving to work.
-	while (state->running && state->stream_node_id == SPA_ID_INVALID) {
-		if (pw_loop_iterate(state->loop, -1) < 0) {
-			pwr_log.errorf("pw_loop_iterate failed");
-			return;
-		}
-	}
-	pwr_log.infof("stream available on node ID: %u", state->stream_node_id);
-
-	pw_loop_add_io(state->loop, nudgePipe[0], SPA_IO_IN, false, nudge_io_event, state);
-
-	// Iterate with a finite timeout so we get a ~60Hz cadence (services pw
-	// events, the nudge pipe, and any delivered buffers), then drive a graph
-	// cycle. This decoupled drive is what keeps the capture clocked.
-	while (state->running) {
-		int ret = pw_loop_iterate(state->loop, 16);
-		if (ret < 0) {
-			pwr_log.errorf("pw_loop_iterate failed");
-			break;
-		}
-		drive_capture(state);
-	}
-
-	pwr_log.infof("exiting");
-	pw_stream_destroy(state->stream);
-	pw_core_disconnect(state->core);
-	pw_context_destroy(state->context);
-	pw_loop_destroy(state->loop);
-}
-
 bool init_pipewire(void)
 {
 	struct pipewire_state *state = &pipewire_state;
 
 	pw_init(nullptr, nullptr);
 
-	if (pipe2(nudgePipe, O_CLOEXEC | O_NONBLOCK) != 0) {
-		pwr_log.errorf_errno("pipe2 failed");
+	state->thread_loop = pw_thread_loop_new("gamescope-pw", nullptr);
+	if (!state->thread_loop) {
+		pwr_log.errorf("pw_thread_loop_new failed");
 		return false;
 	}
 
-	state->loop = pw_loop_new(nullptr);
-	if (!state->loop) {
-		pwr_log.errorf("pw_loop_new failed");
-		return false;
-	}
-
-	state->context = pw_context_new(state->loop, nullptr, 0);
+	// Build the whole object graph before starting the loop. While the loop
+	// thread isn't spinning, no lock is needed.
+	state->context = pw_context_new(pw_thread_loop_get_loop(state->thread_loop), nullptr, 0);
 	if (!state->context) {
 		pwr_log.errorf("pw_context_new failed");
 		return false;
@@ -807,9 +645,10 @@ bool init_pipewire(void)
 	std::vector<const struct spa_pod *> format_params = build_format_params(&builder);
 
 	// Self-clocking driver: DRIVER so we own the graph clock (set_active on
-	// PAUSED + drive_capture() trigger cycles), INACTIVE so activation is
-	// explicit. This is what lets the capture run under a generic session
-	// manager (WirePlumber), not only the Steam Deck's.
+	// PAUSED + a pw_stream_trigger_process() per produced frame), INACTIVE so
+	// activation is explicit. This is what lets the capture run under a generic
+	// session manager (WirePlumber), not only the Steam Deck's. The node id is
+	// published asynchronously in state_changed on PAUSED.
 	enum pw_stream_flags flags = (enum pw_stream_flags)(PW_STREAM_FLAG_DRIVER | PW_STREAM_FLAG_ALLOC_BUFFERS | PW_STREAM_FLAG_INACTIVE);
 	int ret = pw_stream_connect(state->stream, PW_DIRECTION_OUTPUT, PW_ID_ANY, flags, format_params.data(), format_params.size());
 	if (ret != 0) {
@@ -819,17 +658,41 @@ bool init_pipewire(void)
 
 	state->running = true;
 
-	// Do NOT iterate the loop here: it must be iterated on a single thread, so
-	// the node-id wait happens inside run_pipewire on the pw thread instead.
-	std::thread thread(run_pipewire, state);
-	thread.detach();
+	if (pw_thread_loop_start(state->thread_loop) < 0) {
+		pwr_log.errorf("pw_thread_loop_start failed");
+		return false;
+	}
 
 	return true;
 }
 
+void deinit_pipewire(void)
+{
+	struct pipewire_state *state = &pipewire_state;
+
+	if (!state->thread_loop)
+		return;
+
+	// Must be called without the lock held.
+	pw_thread_loop_stop(state->thread_loop);
+
+	if (state->stream)
+		pw_stream_destroy(state->stream);
+	if (state->core)
+		pw_core_disconnect(state->core);
+	if (state->context)
+		pw_context_destroy(state->context);
+	pw_thread_loop_destroy(state->thread_loop);
+
+	state->stream = nullptr;
+	state->core = nullptr;
+	state->context = nullptr;
+	state->thread_loop = nullptr;
+}
+
 uint32_t get_pipewire_stream_node_id(void)
 {
-	return pipewire_state.stream_node_id;
+	return pipewire_state.stream_node_id.load();
 }
 
 bool pipewire_is_streaming()
@@ -843,30 +706,79 @@ bool pipewire_has_consumer()
 	return s_nConsumerBuffers.load(std::memory_order_relaxed) > 0;
 }
 
-struct pipewire_buffer *dequeue_pipewire_buffer(void)
+// steamcompmgr thread: lend a buffer to the producer for render+copy. The lock
+// is held only around the cheap pool calls — never across the GPU work that
+// follows in paint_pipewire — so the pw graph thread is not stalled for a frame.
+struct pipewire_buffer *pipewire_dequeue_buffer(void)
 {
 	struct pipewire_state *state = &pipewire_state;
+
 	// Produce while streaming, or while a consumer's buffers exist but the
 	// stream is still PAUSED — the latter bootstraps the DRIVER stream to
 	// STREAMING (its first queued frame completes the handshake).
-	if (state->streaming || pipewire_has_consumer()) {
-		request_buffer(state);
+	if (!(state->streaming || pipewire_has_consumer()))
+		return nullptr;
+
+	struct pipewire_buffer *buffer = nullptr;
+
+	pw_thread_loop_lock(state->thread_loop);
+	maybe_renegotiate_size_locked(state);
+	struct pw_buffer *pw_buffer = pw_stream_dequeue_buffer(state->stream);
+	if (pw_buffer) {
+		buffer = (struct pipewire_buffer *) pw_buffer->user_data;
+		buffer->in_producer = true;
+	} else {
+		// Pool momentarily drained: above the consumer's recycle rate (e.g. a
+		// 200fps producer vs a ~130fps encoder) the in-flight buffers can all be
+		// queued/held at once. The graph is driven only from submit, so an empty
+		// pool would mean no submit → no trigger → the consumer never runs its
+		// cycle → it never releases what it holds → permanent deadlock ("out of
+		// buffers" storm, cap=0). Drive a cycle here so the consumer drains its
+		// backlog and recycles a buffer for the next frame. Rate-limit the log so
+		// a transient drain doesn't flood it.
+		if (pw_stream_is_driving(state->stream))
+			pw_stream_trigger_process(state->stream);
+		static int s_nOOB = 0;
+		if ((s_nOOB++ % 200) == 0)
+			pwr_log.errorf("warning: out of buffers (draining consumer backlog)");
 	}
-	return out_buffer.exchange(nullptr);
+	pw_thread_loop_unlock(state->thread_loop);
+
+	return buffer;
 }
 
-void push_pipewire_buffer(struct pipewire_buffer *buffer)
+// steamcompmgr thread: hand a rendered buffer back to PipeWire. Called after the
+// GPU render and vulkan_wait have completed with NO lock held. Takes the lock
+// only for the cheap chunk/meta copy + queue + trigger.
+void pipewire_submit_buffer(struct pipewire_buffer *buffer)
 {
-	struct pipewire_buffer *old = in_buffer.exchange(buffer);
-	if ( old != nullptr )
-	{
-		pwr_log.errorf_errno("push_pipewire_buffer: Already had a buffer?!");
-	}
-	nudge_pipewire();
-}
+	struct pipewire_state *state = &pipewire_state;
 
-void nudge_pipewire(void)
-{
-	if (write(nudgePipe[1], "\n", 1) < 0)
-		pwr_log.errorf_errno("nudge_pipewire: write failed");
+	pw_thread_loop_lock(state->thread_loop);
+
+	buffer->in_producer = false;
+
+	if (buffer->buffer == nullptr) {
+		// remove_buffer fired while we were rendering and deferred the free to
+		// us. We're the sole owner now; free once, outside the lock.
+		pw_thread_loop_unlock(state->thread_loop);
+		destroy_buffer(buffer);
+		return;
+	}
+
+	copy_buffer(state, buffer);
+
+	int ret = pw_stream_queue_buffer(state->stream, buffer->buffer);
+	if (ret < 0) {
+		pwr_log.errorf("pw_stream_queue_buffer failed");
+	}
+
+	// Demand-driven drive: one cycle per produced frame. Only a driving node
+	// (STREAMING + driver) may trigger; PAUSED→STREAMING still bootstraps via
+	// the queued frame above. The trigger re-routes the cycle onto the data
+	// loop via a non-blocking pw_loop_invoke, so it is safe under the lock.
+	if (pw_stream_is_driving(state->stream))
+		pw_stream_trigger_process(state->stream);
+
+	pw_thread_loop_unlock(state->thread_loop);
 }

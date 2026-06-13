@@ -2351,21 +2351,12 @@ static void paint_pipewire()
 {
 	static struct pipewire_buffer *s_pPipewireBuffer = nullptr;
 
-	// If the stream stopped/changed, and the underlying pw_buffer was thus
-	// destroyed, then destroy this buffer and grab a new one. The staleness
-	// check + destroy is serialized with the pipewire thread (s_bufferMutex)
-	// inside pipewire_reap_if_stale: without that, a stale `copying` read on the
-	// pipewire side let both threads free the same buffer (SIGABRT in
-	// destroy_buffer with a garbage type). Only clear our pointer if it actually
-	// reaped it.
-	if ( s_pPipewireBuffer && pipewire_reap_if_stale( s_pPipewireBuffer ) )
-	{
-		s_pPipewireBuffer = nullptr;
-	}
-
-	// Queue up a buffer with some metadata.
+	// Queue up a buffer with some metadata. The thread-loop design serializes
+	// every pool access under the pipewire lock, so there is no stale-reap dance
+	// here anymore: a buffer torn down mid-render is freed once by
+	// pipewire_submit_buffer (which sees buffer->buffer == nullptr).
 	if ( !s_pPipewireBuffer )
-		s_pPipewireBuffer = dequeue_pipewire_buffer();
+		s_pPipewireBuffer = pipewire_dequeue_buffer();
 
 	{ static int e = 0; if ( ( e++ % 60 ) == 0 ) xwm_log.infof( "paint_pipewire: ENTER (buf=%p)", (void*)s_pPipewireBuffer ); }
 
@@ -2523,7 +2514,7 @@ static void paint_pipewire()
 	{
 		vulkan_wait( *oPipewireSequence, true );
 
-		push_pipewire_buffer( s_pPipewireBuffer );
+		pipewire_submit_buffer( s_pPipewireBuffer );
 		s_pPipewireBuffer = nullptr;
 	}
 }
@@ -8528,9 +8519,8 @@ steamcompmgr_main(int argc, char **argv)
 			currentHDROutput = g_bOutputHDREnabled;
 			currentHDRForce = g_bForceHDRSupportDebug;
 
-#if HAVE_PIPEWIRE
-			nudge_pipewire();
-#endif
+			// Output size change is now folded into the next
+			// pipewire_dequeue_buffer (maybe_renegotiate_size_locked).
 		}
 
 		// Ask for a new surface every vblank

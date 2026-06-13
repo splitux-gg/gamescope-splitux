@@ -1082,6 +1082,10 @@ int main(int argc, char **argv)
 
 	steamCompMgrThread.join();
 
+#if HAVE_PIPEWIRE
+	deinit_pipewire();
+#endif
+
 	gamescope::Process::KillAllChildren( getpid(), SIGTERM );
 	gamescope::Process::WaitForAllChildren();
 }

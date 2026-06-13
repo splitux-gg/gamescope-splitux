@@ -36,12 +36,16 @@ jobs:
       - name: Build with gcc
         run: |
           export CC=gcc CXX=g++
-          meson build-gcc/ -Dinput_emulation=disabled --werror --auto-features=enabled
+          # -Dwlroots:werror=false: the vendored wlroots 0.18 subproject forces
+          # its own werror=true and breaks under rolling-Arch's newer libinput
+          # (unhandled LIBINPUT_SWITCH_KEYPAD_SLIDE enum). Keep --werror gating
+          # gamescope's own src/, but don't hold vendored wlroots to it.
+          meson build-gcc/ -Dinput_emulation=disabled --werror -Dwlroots:werror=false --auto-features=enabled
           ninja -C build-gcc/
       - name: Build with gcc (no vr)
         run: |
           export CC=gcc CXX=g++
-          meson build-gcc-novr/ -Dinput_emulation=disabled -Denable_openvr_support=false --werror --auto-features=enabled
+          meson build-gcc-novr/ -Dinput_emulation=disabled -Denable_openvr_support=false --werror -Dwlroots:werror=false --auto-features=enabled
           ninja -C build-gcc-novr/
 #      - name: Build with clang
 #        run: |

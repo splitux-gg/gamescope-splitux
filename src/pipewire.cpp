@@ -622,9 +622,20 @@ bool init_pipewire(void)
 		return false;
 	}
 
-	state->stream = pw_stream_new(state->core, "gamescope",
+	// Unique PipeWire node name per instance. With multiple gamescope instances
+	// (splitux-together multi-seat) every node otherwise advertises the same
+	// name, so a consumer matching by name (seat-streamer --pw-name) binds them
+	// all to the FIRST node — every seat captures one instance and the rest are
+	// orphaned. GAMESCOPE_PIPEWIRE_NODE lets the launcher give each instance a
+	// distinct, targetable node name; default keeps the historical "gamescope".
+	const char *pwNodeName = getenv("GAMESCOPE_PIPEWIRE_NODE");
+	if (!pwNodeName || !*pwNodeName)
+		pwNodeName = "gamescope";
+
+	state->stream = pw_stream_new(state->core, pwNodeName,
 		pw_properties_new(
 			PW_KEY_MEDIA_CLASS, "Video/Source",
+			PW_KEY_NODE_NAME, pwNodeName,
 			nullptr));
 	if (!state->stream) {
 		pwr_log.errorf("pw_stream_new failed");

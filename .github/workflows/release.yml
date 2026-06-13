@@ -21,8 +21,17 @@ jobs:
       - name: Prepare
         run: |
           pacman-key --init
-          pacman -Syu --noconfirm
-          pacman -S --noconfirm git meson glslang libcap wlroots0.18 \
+          # The base image ships a single geo-CDN mirror; when a Fastly edge is
+          # flaky pacman aborts the whole transaction. Give it several mirrors
+          # plus retries so a bad edge can't fail the build.
+          cat > /etc/pacman.d/mirrorlist <<'MIRRORS'
+          Server = https://geo.mirror.pkgbuild.com/$repo/os/$arch
+          Server = https://mirrors.kernel.org/archlinux/$repo/os/$arch
+          Server = https://mirror.rackspace.com/archlinux/$repo/os/$arch
+          MIRRORS
+          pac() { for i in 1 2 3; do pacman "$@" && return 0; echo "pacman failed (attempt $i), retrying..."; sleep 10; done; return 1; }
+          pac -Syu --noconfirm
+          pac -S --noconfirm git meson glslang libcap wlroots0.18 \
             sdl2 vulkan-headers libx11 libxmu libxcomposite libxrender libxres \
             libxtst libxkbcommon libdrm libinput wayland-protocols benchmark \
             xorg-xwayland pipewire cmake \

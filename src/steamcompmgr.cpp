@@ -2352,10 +2352,14 @@ static void paint_pipewire()
 	static struct pipewire_buffer *s_pPipewireBuffer = nullptr;
 
 	// If the stream stopped/changed, and the underlying pw_buffer was thus
-	// destroyed, then destroy this buffer and grab a new one.
-	if ( s_pPipewireBuffer && s_pPipewireBuffer->IsStale() )
+	// destroyed, then destroy this buffer and grab a new one. The staleness
+	// check + destroy is serialized with the pipewire thread (s_bufferMutex)
+	// inside pipewire_reap_if_stale: without that, a stale `copying` read on the
+	// pipewire side let both threads free the same buffer (SIGABRT in
+	// destroy_buffer with a garbage type). Only clear our pointer if it actually
+	// reaped it.
+	if ( s_pPipewireBuffer && pipewire_reap_if_stale( s_pPipewireBuffer ) )
 	{
-		pipewire_destroy_buffer( s_pPipewireBuffer );
 		s_pPipewireBuffer = nullptr;
 	}
 

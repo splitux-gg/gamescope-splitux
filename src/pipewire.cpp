@@ -7,6 +7,7 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -26,6 +27,16 @@ static std::atomic<struct pipewire_buffer *> out_buffer;
 // Pending buffer for steamcompmgr → PipeWire
 static std::atomic<struct pipewire_buffer *> in_buffer;
 
+// splitux: serializes the pipewire_buffer ownership token (`copying`) and every
+// free-decision site so the steamcompmgr and pipewire threads can't both free a
+// buffer. The token write in request_buffer (steamcompmgr) was previously a
+// plain cross-thread bool read by remove_buffer (pipewire); a stale read let
+// remove_buffer free a buffer steamcompmgr still held, which then double-freed
+// via paint_pipewire's stale reap → garbage type → assert(false) SIGABRT. The
+// lock is held only for cheap pointer bookkeeping (never across GPU work or a
+// destroy), so it cannot deadlock against the capture/encode path.
+static std::mutex s_bufferMutex;
+
 // Number of buffers allocated for a connected consumer. >0 means a consumer has
 // linked and negotiated buffers; used to run the compositor capture while the
 // stream is still PAUSED so it can bootstrap to STREAMING.
@@ -40,7 +51,15 @@ static uint32_t s_nOutputWidth;
 static uint32_t s_nOutputHeight;
 
 static void destroy_buffer(struct pipewire_buffer *buffer) {
-	assert(buffer->buffer == nullptr);
+	// splitux: these were asserts. The ownership protocol (s_bufferMutex +
+	// `copying`) now guarantees a buffer is freed exactly once, with its
+	// pw_buffer already detached — so neither condition below should ever hold.
+	// But for a live demo, degrade a never-expected residual race to a logged
+	// leak instead of a SIGABRT that kills the compositor mid-session.
+	if (buffer->buffer != nullptr) {
+		pwr_log.errorf("destroy_buffer: pw_buffer still attached (race?) — leaking buffer");
+		return;
+	}
 
 	switch (buffer->type) {
 	case SPA_DATA_MemFd:
@@ -56,8 +75,9 @@ static void destroy_buffer(struct pipewire_buffer *buffer) {
 	case SPA_DATA_DmaBuf:
 		break; // nothing to do
 	default:
-		assert(false); // unreachable
-	}	
+		pwr_log.errorf("destroy_buffer: unexpected buffer type %d (use-after-free?) — leaking buffer", (int)buffer->type);
+		return;
+	}
 
 	// If out_buffer == buffer, then set it to nullptr.
 	// We don't care about the result.
@@ -72,6 +92,24 @@ static void destroy_buffer(struct pipewire_buffer *buffer) {
 void pipewire_destroy_buffer(struct pipewire_buffer *buffer)
 {
 	destroy_buffer(buffer);
+}
+
+// splitux: called by the steamcompmgr thread for a buffer it currently owns
+// (copying == true) when it suspects the stream tore down the underlying
+// pw_buffer. Under s_bufferMutex this is serialized with the pipewire thread's
+// remove_buffer: observing buffer->buffer == nullptr here means remove_buffer
+// already ran to completion and — seeing copying == true — left this buffer for
+// us, so we are its sole owner and free it. Returns true iff destroyed (caller
+// must then drop its pointer). If not stale, the buffer is still live; keep it.
+bool pipewire_reap_if_stale(struct pipewire_buffer *buffer)
+{
+	{
+		std::lock_guard<std::mutex> lock(s_bufferMutex);
+		if (buffer->buffer != nullptr)
+			return false;
+	}
+	destroy_buffer(buffer);
+	return true;
 }
 
 static void calculate_capture_size()
@@ -172,6 +210,13 @@ static std::vector<const struct spa_pod *> build_format_params(struct spa_pod_bu
 
 static void request_buffer(struct pipewire_state *state)
 {
+	// splitux: hold s_bufferMutex across the dequeue, the copying=true mark, and
+	// the publish so this is atomic w.r.t. remove_buffer's free decision. Either
+	// remove_buffer sees copying==true and leaves the buffer for us, or it ran
+	// first and freed it (in which case dequeue won't hand the removed buffer
+	// back). Closes the window where a stale copying read double-freed.
+	std::lock_guard<std::mutex> lock(s_bufferMutex);
+
 	struct pw_buffer *pw_buffer = pw_stream_dequeue_buffer(state->stream);
 	if (!pw_buffer) {
 		pwr_log.errorf("warning: out of buffers");
@@ -300,11 +345,18 @@ static void dispatch_nudge(struct pipewire_state *state, int fd)
 	struct pipewire_buffer *buffer = in_buffer.exchange(nullptr);
 	if (buffer != nullptr) {
 		// We now completely own the buffer, it's no longer shared with the
-		// steamcompmgr thread.
+		// steamcompmgr thread. Clear the ownership token and sample staleness
+		// under the lock so this is ordered against remove_buffer (both run on
+		// this pw thread, so they can't interleave, but request_buffer on the
+		// steamcompmgr thread reads/writes copying under the same lock).
+		bool stale;
+		{
+			std::lock_guard<std::mutex> lock(s_bufferMutex);
+			buffer->copying = false;
+			stale = (buffer->buffer == nullptr);
+		}
 
-		buffer->copying = false;
-
-		if (buffer->buffer != nullptr) {
+		if (!stale) {
 			copy_buffer(state, buffer);
 
 			int ret = pw_stream_queue_buffer(state->stream, buffer->buffer);
@@ -607,9 +659,21 @@ static void stream_handle_remove_buffer(void *data, struct pw_buffer *pw_buffer)
 
 	s_nConsumerBuffers.fetch_sub(1, std::memory_order_relaxed);
 
-	buffer->buffer = nullptr;
+	// Detach the pw_buffer and decide ownership atomically w.r.t. the
+	// steamcompmgr thread. If it's currently copying this buffer, it owns it and
+	// will free it (via dispatch_nudge reclaim or paint_pipewire's stale reap);
+	// only free here if the pw thread still owns it. Freeing is done outside the
+	// lock (delete runs the CVulkanTexture destructor) — once we've decided to
+	// free, copying==false means steamcompmgr isn't referencing it, so we're the
+	// sole owner.
+	bool destroy;
+	{
+		std::lock_guard<std::mutex> lock(s_bufferMutex);
+		buffer->buffer = nullptr;
+		destroy = !buffer->copying;
+	}
 
-	if (!buffer->copying) {
+	if (destroy) {
 		destroy_buffer(buffer);
 	}
 }

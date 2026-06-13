@@ -62,5 +62,6 @@ struct pipewire_buffer *dequeue_pipewire_buffer(void);
 bool pipewire_is_streaming();
 bool pipewire_has_consumer();
 void pipewire_destroy_buffer(struct pipewire_buffer *buffer);
+bool pipewire_reap_if_stale(struct pipewire_buffer *buffer);
 void push_pipewire_buffer(struct pipewire_buffer *buffer);
 void nudge_pipewire(void);

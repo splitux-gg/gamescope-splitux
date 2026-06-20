@@ -55,6 +55,9 @@ extern std::string g_reshade_effect;
 
 // Splitux input device filtering
 extern bool g_bUseLibInputDevices;
+// When set, held devices stay active but parent-compositor input is NOT blocked
+// (mixed local+remote couch session — the local host plays via window focus).
+extern bool g_bLibInputAllowParent;
 
 using namespace std::literals;
 
@@ -2910,7 +2913,7 @@ namespace gamescope
     void CWaylandInputThread::HandleKey( uint32_t uKey, bool bPressed )
     {
         // Splitux: Block parent compositor keyboard input when using libinput devices
-        if ( g_bUseLibInputDevices )
+        if ( g_bUseLibInputDevices && !g_bLibInputAllowParent )
             return;
 
         if ( m_uKeyModifiers & m_uModMask[ GAMESCOPE_WAYLAND_MOD_META ] )
@@ -3081,7 +3084,7 @@ namespace gamescope
 			return;
 
 		// Splitux: Block parent compositor mouse input when using libinput devices
-		if ( g_bUseLibInputDevices )
+		if ( g_bUseLibInputDevices && !g_bLibInputAllowParent )
 			return;
 
 		CWaylandPlane *pPlane = (CWaylandPlane *)wl_surface_get_user_data( m_pCurrentCursorSurface );
@@ -3116,7 +3119,7 @@ namespace gamescope
     void CWaylandInputThread::Wayland_Pointer_Button( wl_pointer *pPointer, uint32_t uSerial, uint32_t uTime, uint32_t uButton, uint32_t uState )
     {
         // Splitux: Block parent compositor mouse input when using libinput devices
-        if ( g_bUseLibInputDevices )
+        if ( g_bUseLibInputDevices && !g_bLibInputAllowParent )
             return;
 
         // Don't do any motion/movement stuff if we don't have kb focus
@@ -3143,7 +3146,7 @@ namespace gamescope
     void CWaylandInputThread::Wayland_Pointer_Axis_Value120( wl_pointer *pPointer, uint32_t uAxis, int32_t nValue120 )
     {
         // Splitux: Block parent compositor mouse input when using libinput devices
-        if ( g_bUseLibInputDevices )
+        if ( g_bUseLibInputDevices && !g_bLibInputAllowParent )
             return;
 
         if ( !cv_wayland_mouse_warp_without_keyboard_focus && !m_bKeyboardEntered )
@@ -3163,7 +3166,7 @@ namespace gamescope
         m_flScrollAccum[1] = 0.0;
 
         // Splitux: Block parent compositor mouse input when using libinput devices
-        if ( g_bUseLibInputDevices )
+        if ( g_bUseLibInputDevices && !g_bLibInputAllowParent )
             return;
 
         if ( !cv_wayland_mouse_warp_without_keyboard_focus && !m_bKeyboardEntered )
@@ -3281,7 +3284,7 @@ namespace gamescope
     void CWaylandInputThread::Wayland_RelativePointer_RelativeMotion( zwp_relative_pointer_v1 *pRelativePointer, uint32_t uTimeHi, uint32_t uTimeLo, wl_fixed_t fDx, wl_fixed_t fDy, wl_fixed_t fDxUnaccel, wl_fixed_t fDyUnaccel )
     {
 		// Splitux: Block parent compositor mouse input when using libinput devices
-		if ( g_bUseLibInputDevices )
+		if ( g_bUseLibInputDevices && !g_bLibInputAllowParent )
 			return;
 
 		// Don't do any motion/movement stuff if we don't have kb focus

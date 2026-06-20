@@ -58,6 +58,13 @@ std::vector<std::string> g_vecLibInputHoldDevices;
 bool g_bUseLibInputDevices = false;
 bool g_bBackendDisableKeyboard = false;
 bool g_bBackendDisableMouse = false;
+// When held devices are in use we normally block the parent compositor's input
+// entirely (so a pure-remote seat can't be driven by the host desktop). For a
+// MIXED couch session — a local host playing the same instance a remote friend's
+// seat streams — the host still needs the parent compositor's keyboard/mouse via
+// window focus. This flag keeps the held devices but ALSO lets parent input
+// through, so local + remote players share the one instance.
+bool g_bLibInputAllowParent = false;
 
 int g_nCursorScaleHeight = -1;
 
@@ -165,6 +172,7 @@ const struct option *gamescope_options = (struct option[]){
 
 	// Splitux input device filtering options
 	{ "libinput-hold-dev", required_argument, nullptr, 0 },
+	{ "libinput-allow-parent", no_argument, nullptr, 0 },
 	{ "backend-disable-keyboard", no_argument, nullptr, 0 },
 	{ "backend-disable-mouse", no_argument, nullptr, 0 },
 
@@ -849,6 +857,8 @@ int main(int argc, char **argv)
 					if (!paths.empty()) {
 						g_vecLibInputHoldDevices.push_back(paths);
 					}
+				} else if (strcmp(opt_name, "libinput-allow-parent") == 0) {
+					g_bLibInputAllowParent = true;
 				} else if (strcmp(opt_name, "backend-disable-keyboard") == 0) {
 					g_bBackendDisableKeyboard = true;
 				} else if (strcmp(opt_name, "backend-disable-mouse") == 0) {

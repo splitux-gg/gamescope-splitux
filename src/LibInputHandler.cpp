@@ -18,6 +18,9 @@
 
 // Splitux input device filtering (defined in main.cpp)
 extern std::vector<std::string> g_vecLibInputHoldDevices;
+// Output dimensions, for mapping absolute-pointer axes → cursor pixels (main.cpp)
+extern uint32_t g_nOutputWidth;
+extern uint32_t g_nOutputHeight;
 extern bool g_bBackendDisableKeyboard;
 extern bool g_bBackendDisableMouse;
 
@@ -214,8 +217,15 @@ namespace gamescope
 
                     libinput_event_pointer *pPointerEvent = libinput_event_get_pointer_event( pEvent );
 
-                    double flX = libinput_event_pointer_get_absolute_x( pPointerEvent );
-                    double flY = libinput_event_pointer_get_absolute_y( pPointerEvent );
+                    // Map the abs axes to OUTPUT PIXELS. The non-transformed
+                    // get_absolute_x() returns millimetres (needs a device
+                    // resolution we don't set → ~0), but wlserver_mousewarp wants
+                    // cursor pixels — that mismatch pinned the cursor to the corner.
+                    // The _transformed variant maps [axis min,max] → [0,size]
+                    // linearly, ignoring resolution, exactly like the touch path
+                    // (tx *= g_nOutputWidth).
+                    double flX = libinput_event_pointer_get_absolute_x_transformed( pPointerEvent, g_nOutputWidth );
+                    double flY = libinput_event_pointer_get_absolute_y_transformed( pPointerEvent, g_nOutputHeight );
 
                     GetBackend()->NotifyPhysicalInput( InputType::Mouse );
 
